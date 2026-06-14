@@ -257,6 +257,17 @@ def build_csv(batch_name, batch_data):
                 "day_avg_darkness": avg_darkness,
                 "day_avg_area": avg_area,
             })
+        all_darkness = [c["darkness_score"] for c in day["colonies"]]
+        all_area = [c["area_px"] for c in day["colonies"]]
+        rows.append({
+            "batch": batch_name,
+            "date": day["date"].strftime("%Y-%m-%d"),
+            "colony_id": "AVERAGE",
+            "area_px": round(float(np.mean(all_area)), 1),
+            "darkness_score": round(float(np.mean(all_darkness)), 2),
+            "std_darkness": round(float(np.std(all_darkness)), 2),
+            "std_area": round(float(np.std(all_area)), 1),
+        })
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
@@ -302,9 +313,10 @@ if run_btn and uploaded_files:
     progress = st.progress(0)
     processed = 0
 
+    batch_results = []
+
     # ── Process each batch ────────────────────────────────────────────────────
     for batch_name in sorted(batches.keys()):
-        st.markdown(f"## Batch {batch_name}")
         batch_days = batches[batch_name]
         batch_data = []
 
@@ -326,20 +338,13 @@ if run_btn and uploaded_files:
             progress.progress(processed / total_images)
             status.empty()
 
-        # ── Charts ────────────────────────────────────────────────────────────
-        dark_chart = make_chart(batch_data, "darkness_score", "Darkness Score (255 − mean intensity)", batch_name)
-        area_chart = make_chart(batch_data, "area_px", "Colony Area (px)", batch_name)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(dark_chart, caption=f"Batch {batch_name} — Darkness Score", use_column_width=True)
-        with col2:
-            st.image(area_chart, caption=f"Batch {batch_name} — Colony Area", use_column_width=True)
+        # ── Generate chart bytes (stored so reruns don't recompute) ──────────
+        dark_chart_bytes = make_chart(batch_data, "darkness_score", "Darkness Score (255 − mean intensity)", batch_name).getvalue()
+        area_chart_bytes = make_chart(batch_data, "area_px", "Colony Area (px)", batch_name).getvalue()
 
         # ── Summary table (colony averages across all days) ───────────────────
-        st.markdown(f"#### Colony Averages — Batch {batch_name}")
-        summary_rows = []
         colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
+        summary_rows = []
         for cid in colony_ids:
             d_scores = []
             a_scores = []
@@ -354,7 +359,6 @@ if run_btn and uploaded_files:
                 "Avg Area (px)": round(np.mean(a_scores), 1) if a_scores else 0,
             })
 
-        # Add average of averages
         df_sum = pd.DataFrame(summary_rows)
         avg_row = pd.DataFrame([{
             "Colony": "AVERAGE",
@@ -362,32 +366,64 @@ if run_btn and uploaded_files:
             "Avg Area (px)": round(df_sum["Avg Area (px)"].mean(), 1),
         }])
         df_sum = pd.concat([df_sum, avg_row], ignore_index=True)
-        st.dataframe(df_sum, use_container_width=True, hide_index=True)
 
-        # ── Downloads ─────────────────────────────────────────────────────────
+        # ── Build download bytes ──────────────────────────────────────────────
+        csv_bytes = build_csv(batch_name, batch_data)
+        word_bytes = build_word_doc(
+            batch_name, batch_data,
+            make_chart(batch_data, "darkness_score", "Darkness Score", batch_name),
+            make_chart(batch_data, "area_px", "Colony Area (px)", batch_name),
+        ).getvalue()
+
+        batch_results.append({
+            "batch_name": batch_name,
+            "batch_data": batch_data,
+            "dark_chart_bytes": dark_chart_bytes,
+            "area_chart_bytes": area_chart_bytes,
+            "df_summary": df_sum,
+            "csv_bytes": csv_bytes,
+            "word_bytes": word_bytes,
+        })
+
+    st.session_state.batch_results = batch_results
+    progress.progress(1.0)
+    st.success("✅ All batches complete!")
+
+# ── Display results (persists across reruns so downloads don't clear UI) ──────
+if "batch_results" in st.session_state:
+    for result in st.session_state.batch_results:
+        batch_name = result["batch_name"]
+
+        st.markdown(f"## Batch {batch_name}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Darkness Score", use_column_width=True)
+        with col2:
+            st.image(result["area_chart_bytes"], caption=f"Batch {batch_name} — Colony Area", use_column_width=True)
+
+        st.markdown(f"#### Colony Averages — Batch {batch_name}")
+        st.dataframe(result["df_summary"], use_container_width=True, hide_index=True)
+
         st.markdown(f"#### Download — Batch {batch_name}")
         dl1, dl2 = st.columns(2)
         with dl1:
             st.download_button(
                 f"📥 CSV — Batch {batch_name}",
-                build_csv(batch_name, batch_data),
+                result["csv_bytes"],
                 file_name=f"batch_{batch_name}_analysis.csv",
                 mime="text/csv",
-                use_container_width=True
+                use_container_width=True,
+                key=f"csv_{batch_name}",
             )
         with dl2:
-            word_buf = build_word_doc(batch_name, batch_data,
-                                      make_chart(batch_data, "darkness_score", "Darkness Score", batch_name),
-                                      make_chart(batch_data, "area_px", "Colony Area (px)", batch_name))
             st.download_button(
                 f"📄 Word Report — Batch {batch_name}",
-                word_buf,
+                result["word_bytes"],
                 file_name=f"batch_{batch_name}_report.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True
+                use_container_width=True,
+                key=f"word_{batch_name}",
             )
 
         st.markdown("---")
-
-    progress.progress(1.0)
-    st.success("✅ All batches complete!")
