@@ -41,19 +41,62 @@ def parse_filename(filename):
     return batch, date
 
 # ── Colony detection ──────────────────────────────────────────────────────────
+def estimate_local_background(gray, colony_mask, bbox, ring_margin=18, ring_width=35):
+    """
+    Estimate the local agar/background intensity around one colony.
+
+    The background is measured in a rectangular ring surrounding the colony bbox.
+    Colony pixels are excluded from the ring. A median is used because it is less
+    sensitive to small specks, dust, glare, or nearby dark pixels than a mean.
+    """
+    height, width = gray.shape
+    x, y, w, h = bbox
+
+    # Outer rectangle around colony
+    x1 = max(0, x - ring_margin - ring_width)
+    y1 = max(0, y - ring_margin - ring_width)
+    x2 = min(width, x + w + ring_margin + ring_width)
+    y2 = min(height, y + h + ring_margin + ring_width)
+
+    # Inner rectangle to exclude the colony and the immediate fuzzy edge
+    ix1 = max(0, x - ring_margin)
+    iy1 = max(0, y - ring_margin)
+    ix2 = min(width, x + w + ring_margin)
+    iy2 = min(height, y + h + ring_margin)
+
+    ring_mask = np.zeros_like(gray, dtype=np.uint8)
+    ring_mask[y1:y2, x1:x2] = 1
+    ring_mask[iy1:iy2, ix1:ix2] = 0
+
+    # Exclude all detected colony pixels from the background ring.
+    ring_mask[colony_mask > 0] = 0
+
+    bg_pixels = gray[ring_mask > 0]
+    if bg_pixels.size < 50:
+        # Fallback: use the brightest half of the full image as a rough agar estimate.
+        flat = gray.flatten()
+        cutoff = np.percentile(flat, 50)
+        bg_pixels = flat[flat >= cutoff]
+
+    return float(np.median(bg_pixels)) if bg_pixels.size else 255.0
+
+
 def detect_colonies(image_np):
     """
-    Find exactly 16 colonies:
-    1. Convert to grayscale, even out lighting
-    2. Threshold to find dark blobs
-    3. Filter out blobs smaller than min_area (splashes)
-    4. Take the 16 largest remaining blobs
-    5. Sort into 4x4 grid by position (row then col)
-    Returns list of 16 dicts with position, centroid, bbox, area, mean_intensity, darkness_score, integrated_darkness
+    Find exactly 16 colonies and measure growth using background-corrected
+    integrated darkness.
+
+    Main growth metric:
+        background_corrected_integrated_darkness =
+            sum(max(local_background_intensity - colony_pixel_intensity, 0))
+
+    This rewards faint outward expansion while reducing plate-to-plate lighting
+    effects, because each colony is compared with its local agar background.
     """
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
 
-    # Even out uneven lighting
+    # Even out uneven lighting for segmentation only.
+    # Measurements below are taken from the original grayscale image.
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray_eq = clahe.apply(gray)
 
@@ -67,6 +110,8 @@ def detect_colonies(image_np):
     # Find blobs
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
 
+    all_colony_mask = (labels > 0).astype(np.uint8)
+
     colonies = []
     for label_idx in range(1, num_labels):  # skip background (0)
         area = int(stats[label_idx, cv2.CC_STAT_AREA])
@@ -76,16 +121,25 @@ def detect_colonies(image_np):
         h = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
         cx, cy = centroids[label_idx]
 
-        # Mean intensity from original (non-equalized) image within the blob mask.
-        # darkness_score is kept as a mean-based QC/debugging metric.
-        # integrated_darkness is the primary growth metric: sum of pixel darkness
-        # across the entire detected colony mask. This increases when colonies
-        # expand, even if the new outer pixels are faint.
         blob_mask = (labels == label_idx).astype(np.uint8)
-        pixel_values = gray[labels == label_idx]
-        mean_intensity = float(np.mean(pixel_values))
+        pixel_values = gray[labels == label_idx].astype(np.float32)
+
+        mean_intensity = float(np.mean(pixel_values)) if pixel_values.size else 255.0
+
+        # Kept for QC/debugging only: mean-based darkness can be misleading for growth.
         darkness_score = round(255 - mean_intensity, 2)
-        integrated_darkness = round(float(np.sum(255 - pixel_values)), 2)
+
+        # Kept for comparison/debugging only: raw integrated darkness assumes background=255.
+        integrated_darkness = round(float(np.sum(255 - pixel_values)), 2) if pixel_values.size else 0.0
+
+        local_background_intensity = estimate_local_background(
+            gray=gray,
+            colony_mask=all_colony_mask,
+            bbox=(x, y, w, h),
+        )
+
+        corrected_pixel_darkness = np.maximum(local_background_intensity - pixel_values, 0)
+        background_corrected_integrated_darkness = round(float(np.sum(corrected_pixel_darkness)), 2)
 
         colonies.append({
             "area_px": area,
@@ -93,8 +147,11 @@ def detect_colonies(image_np):
             "cy": float(cy),
             "bbox": (x, y, w, h),
             "mean_intensity": round(mean_intensity, 2),
+            "local_background_intensity": round(local_background_intensity, 2),
             "darkness_score": darkness_score,
             "integrated_darkness": integrated_darkness,
+            "background_corrected_integrated_darkness": background_corrected_integrated_darkness,
+            "relative_growth": np.nan,
         })
 
     # Take 16 largest
@@ -104,8 +161,13 @@ def detect_colonies(image_np):
         # Pad missing colonies with zeros
         while len(colonies) < 16:
             colonies.append({
-                "area_px": 0, "cx": 0.0, "cy": 0.0, "bbox": (0,0,0,0),
-                "mean_intensity": 255.0, "darkness_score": 0.0, "integrated_darkness": 0.0
+                "area_px": 0, "cx": 0.0, "cy": 0.0, "bbox": (0, 0, 0, 0),
+                "mean_intensity": 255.0,
+                "local_background_intensity": 255.0,
+                "darkness_score": 0.0,
+                "integrated_darkness": 0.0,
+                "background_corrected_integrated_darkness": 0.0,
+                "relative_growth": np.nan,
             })
 
     # Sort into 4x4 grid: sort by Y (row) then X (col)
@@ -124,6 +186,33 @@ def detect_colonies(image_np):
 
     return result
 
+
+def add_relative_growth(batch_data, metric="background_corrected_integrated_darkness"):
+    """
+    Add fold-change from day 1 for each colony within a batch.
+    If the first-day value is zero or missing, relative growth is left as NaN.
+    """
+    if not batch_data:
+        return batch_data
+
+    colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
+    baseline_by_colony = {}
+    for cid in colony_ids:
+        first_colony = next((c for c in batch_data[0]["colonies"] if c["colony_id"] == cid), None)
+        baseline = first_colony.get(metric, 0) if first_colony else 0
+        baseline_by_colony[cid] = baseline if baseline and baseline > 0 else np.nan
+
+    for day in batch_data:
+        for colony in day["colonies"]:
+            baseline = baseline_by_colony.get(colony["colony_id"], np.nan)
+            value = colony.get(metric, 0)
+            if np.isfinite(baseline) and baseline > 0:
+                colony["relative_growth"] = round(float(value / baseline), 3)
+            else:
+                colony["relative_growth"] = np.nan
+
+    return batch_data
+
 # ── QC checks ─────────────────────────────────────────────────────────────────
 def run_qc(colony):
     flags = []
@@ -136,8 +225,8 @@ def run_qc(colony):
 # ── Chart builder ─────────────────────────────────────────────────────────────
 def make_chart(batch_data, metric, metric_label, batch_name):
     """
-    batch_data: list of {date, colonies: [{colony_id, area_px, integrated_darkness, ...}]}
-    metric: 'integrated_darkness' or 'area_px'
+    batch_data: list of {date, colonies: [{colony_id, area_px, relative_growth, ...}]}
+    metric examples: 'relative_growth', 'background_corrected_integrated_darkness', or 'area_px'
     Returns matplotlib figure as BytesIO PNG
     """
     dates = [d["date"] for d in batch_data]
@@ -153,17 +242,20 @@ def make_chart(batch_data, metric, metric_label, batch_name):
         values = []
         for day in batch_data:
             colony = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
-            values.append(colony[metric] if colony else 0)
+            value = colony.get(metric, np.nan) if colony else np.nan
+            values.append(np.nan if pd.isna(value) else value)
         ax.plot(date_labels, values, color=colors[i], alpha=0.4, linewidth=1.2, label=cid)
         all_values.append(values)
 
-    # Average line
-    avg_values = np.mean(all_values, axis=0)
+    # Average line, ignoring NaNs from missing/zero baselines.
+    avg_values = np.nanmean(np.array(all_values, dtype=float), axis=0)
     ax.plot(date_labels, avg_values, color="black", linewidth=2.5, label="Average", zorder=5)
 
     ax.set_title(f"Batch {batch_name} — {metric_label} Over Time", fontsize=13, fontweight="bold")
     ax.set_xlabel("Date")
     ax.set_ylabel(metric_label)
+    if metric == "relative_growth":
+        ax.axhline(1, color="gray", linestyle="--", linewidth=1, alpha=0.6)
     ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=7, ncol=1)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -186,19 +278,20 @@ def set_cell_bg(cell, hex_color):
     tcPr.append(shd)
 
 
-def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf):
+def build_word_doc(batch_name, batch_data, growth_chart_buf, area_chart_buf):
     doc = Document()
     title = doc.add_heading(f"Colony Analysis Report — Batch {batch_name}", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     dates_str = ", ".join(d["date"].strftime("%b %d %Y") for d in batch_data)
     doc.add_paragraph(f"Dates analyzed: {dates_str}")
     doc.add_paragraph(f"Colonies per plate: 16 (4×4 grid, technical replicates)")
+    doc.add_paragraph("Growth metric: background-corrected integrated darkness, plotted as fold change from day 1.")
     doc.add_paragraph("")
 
     # Charts
-    doc.add_heading("Integrated Darkness Over Time", level=1)
-    dark_chart_buf.seek(0)
-    doc.add_picture(dark_chart_buf, width=Inches(6))
+    doc.add_heading("Relative Growth Over Time", level=1)
+    growth_chart_buf.seek(0)
+    doc.add_picture(growth_chart_buf, width=Inches(6))
     doc.add_paragraph("")
 
     doc.add_heading("Colony Area Over Time", level=1)
@@ -211,17 +304,26 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf):
     for day in batch_data:
         doc.add_heading(day["date"].strftime("%B %d, %Y"), level=2)
 
-        # Average row
         valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_integrated_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
+        avg_bc_integrated_darkness = round(np.mean([c["background_corrected_integrated_darkness"] for c in valid]), 2) if valid else 0
+        relative_values = [c["relative_growth"] for c in valid if not pd.isna(c["relative_growth"])]
+        avg_relative_growth = round(float(np.mean(relative_values)), 3) if relative_values else np.nan
         avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
         flags = sum(1 for c in day["colonies"] if c["qc_flag"] == "FLAG")
-        doc.add_paragraph(f"Average integrated darkness: {avg_integrated_darkness}   |   Average area: {avg_area} px   |   Flagged: {flags}/16")
+        doc.add_paragraph(
+            f"Average background-corrected integrated darkness: {avg_bc_integrated_darkness}   |   "
+            f"Average relative growth: {avg_relative_growth}   |   "
+            f"Average area: {avg_area} px   |   Flagged: {flags}/16"
+        )
 
-        table = doc.add_table(rows=1, cols=6)
+        table = doc.add_table(rows=1, cols=8)
         table.style = "Table Grid"
         hdr = table.rows[0].cells
-        for i, h in enumerate(["Colony", "Area (px)", "Mean Intensity", "Integrated Darkness", "QC", "Notes"]):
+        headers = [
+            "Colony", "Area (px)", "Mean Intensity", "Local Background",
+            "BC Integrated Darkness", "Relative Growth", "QC", "Notes"
+        ]
+        for i, h in enumerate(headers):
             hdr[i].text = h
             hdr[i].paragraphs[0].runs[0].bold = True
             set_cell_bg(hdr[i], "D9E1F2")
@@ -231,10 +333,12 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf):
             rc[0].text = c["colony_id"]
             rc[1].text = str(c["area_px"])
             rc[2].text = str(c["mean_intensity"])
-            rc[3].text = str(c["integrated_darkness"])
-            rc[4].text = c["qc_flag"]
-            rc[5].text = c["qc_note"]
-            set_cell_bg(rc[4], "FFD7D7" if c["qc_flag"] == "FLAG" else "D7FFD7")
+            rc[3].text = str(c["local_background_intensity"])
+            rc[4].text = str(c["background_corrected_integrated_darkness"])
+            rc[5].text = "" if pd.isna(c["relative_growth"]) else str(c["relative_growth"])
+            rc[6].text = c["qc_flag"]
+            rc[7].text = c["qc_note"]
+            set_cell_bg(rc[6], "FFD7D7" if c["qc_flag"] == "FLAG" else "D7FFD7")
 
         doc.add_paragraph("")
 
@@ -249,7 +353,9 @@ def build_csv(batch_name, batch_data):
     rows = []
     for day in batch_data:
         valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_integrated_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
+        avg_bc_integrated_darkness = round(np.mean([c["background_corrected_integrated_darkness"] for c in valid]), 2) if valid else 0
+        relative_values = [c["relative_growth"] for c in valid if not pd.isna(c["relative_growth"])]
+        avg_relative_growth = round(float(np.mean(relative_values)), 3) if relative_values else np.nan
         avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
         for c in day["colonies"]:
             rows.append({
@@ -258,21 +364,29 @@ def build_csv(batch_name, batch_data):
                 "colony_id": c["colony_id"],
                 "area_px": c["area_px"],
                 "mean_intensity": c["mean_intensity"],
-                "integrated_darkness": c["integrated_darkness"],
+                "local_background_intensity": c["local_background_intensity"],
+                "darkness_score_debug_mean_based": c["darkness_score"],
+                "raw_integrated_darkness_debug": c["integrated_darkness"],
+                "background_corrected_integrated_darkness": c["background_corrected_integrated_darkness"],
+                "relative_growth_fold_change_from_day_1": c["relative_growth"],
                 "qc_flag": c["qc_flag"],
                 "qc_note": c["qc_note"],
-                "day_avg_integrated_darkness": avg_integrated_darkness,
+                "day_avg_background_corrected_integrated_darkness": avg_bc_integrated_darkness,
+                "day_avg_relative_growth": avg_relative_growth,
                 "day_avg_area": avg_area,
             })
-        all_integrated_darkness = [c["integrated_darkness"] for c in day["colonies"]]
+        all_bc = [c["background_corrected_integrated_darkness"] for c in day["colonies"]]
+        all_relative = [c["relative_growth"] for c in day["colonies"] if not pd.isna(c["relative_growth"])]
         all_area = [c["area_px"] for c in day["colonies"]]
         rows.append({
             "batch": batch_name,
             "date": day["date"].strftime("%Y-%m-%d"),
             "colony_id": "AVERAGE",
             "area_px": round(float(np.mean(all_area)), 1),
-            "integrated_darkness": round(float(np.mean(all_integrated_darkness)), 2),
-            "std_integrated_darkness": round(float(np.std(all_integrated_darkness)), 2),
+            "background_corrected_integrated_darkness": round(float(np.mean(all_bc)), 2),
+            "relative_growth_fold_change_from_day_1": round(float(np.mean(all_relative)), 3) if all_relative else np.nan,
+            "std_background_corrected_integrated_darkness": round(float(np.std(all_bc)), 2),
+            "std_relative_growth": round(float(np.std(all_relative)), 3) if all_relative else np.nan,
             "std_area": round(float(np.std(all_area)), 1),
         })
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
@@ -345,8 +459,11 @@ if run_btn and uploaded_files:
             progress.progress(processed / total_images)
             status.empty()
 
+        # Calculate fold-change from day 1 for each colony in this batch.
+        batch_data = add_relative_growth(batch_data)
+
         # ── Generate chart bytes (stored so reruns don't recompute) ──────────
-        dark_chart_bytes = make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name).getvalue()
+        dark_chart_bytes = make_chart(batch_data, "relative_growth", "Relative Growth (Fold Change from Day 1)", batch_name).getvalue()
         area_chart_bytes = make_chart(batch_data, "area_px", "Colony Area (px)", batch_name).getvalue()
 
         # ── Summary table (colony averages across all days) ───────────────────
@@ -358,18 +475,23 @@ if run_btn and uploaded_files:
             for day in batch_data:
                 match = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
                 if match:
-                    d_scores.append(match["integrated_darkness"])
+                    d_scores.append(match["background_corrected_integrated_darkness"])
                     a_scores.append(match["area_px"])
+            final_match = next((c for c in batch_data[-1]["colonies"] if c["colony_id"] == cid), None)
+            final_relative_growth = final_match.get("relative_growth", np.nan) if final_match else np.nan
             summary_rows.append({
                 "Colony": cid,
-                "Avg Integrated Darkness": round(np.mean(d_scores), 2) if d_scores else 0,
+                "Avg BC Integrated Darkness": round(np.mean(d_scores), 2) if d_scores else 0,
+                "Final Relative Growth": "" if pd.isna(final_relative_growth) else round(float(final_relative_growth), 3),
                 "Avg Area (px)": round(np.mean(a_scores), 1) if a_scores else 0,
             })
 
         df_sum = pd.DataFrame(summary_rows)
+        final_growth_numeric = pd.to_numeric(df_sum["Final Relative Growth"], errors="coerce")
         avg_row = pd.DataFrame([{
             "Colony": "AVERAGE",
-            "Avg Integrated Darkness": round(df_sum["Avg Integrated Darkness"].mean(), 2),
+            "Avg BC Integrated Darkness": round(df_sum["Avg BC Integrated Darkness"].mean(), 2),
+            "Final Relative Growth": round(final_growth_numeric.mean(), 3),
             "Avg Area (px)": round(df_sum["Avg Area (px)"].mean(), 1),
         }])
         df_sum = pd.concat([df_sum, avg_row], ignore_index=True)
@@ -378,7 +500,7 @@ if run_btn and uploaded_files:
         csv_bytes = build_csv(batch_name, batch_data)
         word_bytes = build_word_doc(
             batch_name, batch_data,
-            make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name),
+            make_chart(batch_data, "relative_growth", "Relative Growth (Fold Change from Day 1)", batch_name),
             make_chart(batch_data, "area_px", "Colony Area (px)", batch_name),
         ).getvalue()
 
@@ -405,11 +527,11 @@ if "batch_results" in st.session_state:
 
         col1, col2 = st.columns(2)
         with col1:
-            st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Integrated Darkness", use_column_width=True)
+            st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Relative Growth", use_column_width=True)
         with col2:
             st.image(result["area_chart_bytes"], caption=f"Batch {batch_name} — Colony Area", use_column_width=True)
 
-        st.markdown(f"#### Colony Averages — Batch {batch_name}")
+        st.markdown(f"#### Colony Summary — Batch {batch_name}")
         st.dataframe(result["df_summary"], use_container_width=True, hide_index=True)
 
         st.markdown(f"#### Download — Batch {batch_name}")
