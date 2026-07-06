@@ -24,18 +24,6 @@ with st.sidebar:
     st.header("⚙️ Settings")
     st.markdown("**Filename format:** `A20260611.jpg` → Batch A, June 11 2026")
     st.markdown("---")
-    st.markdown("**Colony region sensitivity**")
-    edge_permissiveness = st.slider(
-        "Faint-edge permissiveness",
-        min_value=0, max_value=60, value=15, step=1,
-        help=(
-            "Raises the darkness threshold above the automatic (Otsu) level so faint "
-            "outer edges of growing colonies get counted in the colony region. "
-            "Higher = more faint edge included. Affects area_px and integrated_darkness "
-            "(both use this region); darkness_score stays the mean over the same region."
-        ),
-    )
-    st.markdown("---")
     st.markdown("**How to use:**\n1. Upload all images\n2. Click Analyze\n3. Download results per batch")
 
 # ── Filename parser ───────────────────────────────────────────────────────────
@@ -53,7 +41,7 @@ def parse_filename(filename):
     return batch, date
 
 # ── Colony detection ──────────────────────────────────────────────────────────
-def detect_colonies(image_np, edge_permissiveness=15):
+def detect_colonies(image_np):
     """
     Find exactly 16 colonies:
     1. Convert to grayscale, even out lighting
@@ -61,13 +49,7 @@ def detect_colonies(image_np, edge_permissiveness=15):
     3. Filter out blobs smaller than min_area (splashes)
     4. Take the 16 largest remaining blobs
     5. Sort into 4x4 grid by position (row then col)
-    Returns list of 16 dicts with position, centroid, bbox, area, mean_intensity,
-    darkness_score, integrated_darkness
-
-    edge_permissiveness raises the threshold above the automatic (Otsu) level so
-    fainter outer edges of colonies get included in the colony region. The same
-    region is used for area_px and integrated_darkness; darkness_score is the mean
-    darkness over that region.
+    Returns list of 16 dicts with position, centroid, bbox, area, mean_intensity, darkness_score, integrated_darkness
     """
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
 
@@ -75,12 +57,8 @@ def detect_colonies(image_np, edge_permissiveness=15):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray_eq = clahe.apply(gray)
 
-    # Threshold — colonies are dark on light background.
-    # First find the automatic Otsu cut, then loosen it by edge_permissiveness so
-    # fainter (lighter) edge pixels also qualify as part of the colony region.
-    otsu_val, _ = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    permissive_val = min(255, otsu_val + edge_permissiveness)
-    _, thresh = cv2.threshold(gray_eq, permissive_val, 255, cv2.THRESH_BINARY_INV)
+    # Threshold — colonies are dark on light background
+    _, thresh = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     # Morphological closing to fill holes in colonies
     kernel = np.ones((5, 5), np.uint8)
@@ -98,15 +76,16 @@ def detect_colonies(image_np, edge_permissiveness=15):
         h = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
         cx, cy = centroids[label_idx]
 
-        # Mean intensity from original (non-equalized) image within the blob mask
-        blob_mask = (labels == label_idx)
-        mask_u8 = blob_mask.astype(np.uint8)
-        mean_intensity = float(cv2.mean(gray, mask=mask_u8)[0])
+        # Mean intensity from original (non-equalized) image within the blob mask.
+        # darkness_score is kept as a mean-based QC/debugging metric.
+        # integrated_darkness is the primary growth metric: sum of pixel darkness
+        # across the entire detected colony mask. This increases when colonies
+        # expand, even if the new outer pixels are faint.
+        blob_mask = (labels == label_idx).astype(np.uint8)
+        pixel_values = gray[labels == label_idx]
+        mean_intensity = float(np.mean(pixel_values))
         darkness_score = round(255 - mean_intensity, 2)
-
-        # Integrated darkness: total darkness summed over every pixel in the region
-        # (captures biomass — faint expanding edges add pixels instead of lowering a mean)
-        integrated_darkness = float(np.sum(255.0 - gray[blob_mask].astype(np.float64)))
+        integrated_darkness = round(float(np.sum(255 - pixel_values)), 2)
 
         colonies.append({
             "area_px": area,
@@ -115,7 +94,7 @@ def detect_colonies(image_np, edge_permissiveness=15):
             "bbox": (x, y, w, h),
             "mean_intensity": round(mean_intensity, 2),
             "darkness_score": darkness_score,
-            "integrated_darkness": round(integrated_darkness, 1),
+            "integrated_darkness": integrated_darkness,
         })
 
     # Take 16 largest
@@ -126,8 +105,7 @@ def detect_colonies(image_np, edge_permissiveness=15):
         while len(colonies) < 16:
             colonies.append({
                 "area_px": 0, "cx": 0.0, "cy": 0.0, "bbox": (0,0,0,0),
-                "mean_intensity": 255.0, "darkness_score": 0.0,
-                "integrated_darkness": 0.0
+                "mean_intensity": 255.0, "darkness_score": 0.0, "integrated_darkness": 0.0
             })
 
     # Sort into 4x4 grid: sort by Y (row) then X (col)
@@ -158,8 +136,8 @@ def run_qc(colony):
 # ── Chart builder ─────────────────────────────────────────────────────────────
 def make_chart(batch_data, metric, metric_label, batch_name):
     """
-    batch_data: list of {date, colonies: [{colony_id, area_px, darkness_score, ...}]}
-    metric: 'darkness_score' or 'area_px'
+    batch_data: list of {date, colonies: [{colony_id, area_px, integrated_darkness, ...}]}
+    metric: 'integrated_darkness' or 'area_px'
     Returns matplotlib figure as BytesIO PNG
     """
     dates = [d["date"] for d in batch_data]
@@ -208,7 +186,7 @@ def set_cell_bg(cell, hex_color):
     tcPr.append(shd)
 
 
-def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf, integ_chart_buf):
+def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf):
     doc = Document()
     title = doc.add_heading(f"Colony Analysis Report — Batch {batch_name}", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -218,7 +196,7 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf, integ
     doc.add_paragraph("")
 
     # Charts
-    doc.add_heading("Darkness Score Over Time", level=1)
+    doc.add_heading("Integrated Darkness Over Time", level=1)
     dark_chart_buf.seek(0)
     doc.add_picture(dark_chart_buf, width=Inches(6))
     doc.add_paragraph("")
@@ -228,11 +206,6 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf, integ
     doc.add_picture(area_chart_buf, width=Inches(6))
     doc.add_paragraph("")
 
-    doc.add_heading("Integrated Darkness Over Time", level=1)
-    integ_chart_buf.seek(0)
-    doc.add_picture(integ_chart_buf, width=Inches(6))
-    doc.add_paragraph("")
-
     # Per-day tables
     doc.add_heading("Raw Data Per Day", level=1)
     for day in batch_data:
@@ -240,19 +213,15 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf, integ
 
         # Average row
         valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_darkness = round(np.mean([c["darkness_score"] for c in valid]), 2) if valid else 0
+        avg_integrated_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
         avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
-        avg_integ = round(np.mean([c["integrated_darkness"] for c in valid]), 1) if valid else 0
         flags = sum(1 for c in day["colonies"] if c["qc_flag"] == "FLAG")
-        doc.add_paragraph(
-            f"Average darkness: {avg_darkness}   |   Average area: {avg_area} px   |   "
-            f"Average integrated darkness: {avg_integ}   |   Flagged: {flags}/16"
-        )
+        doc.add_paragraph(f"Average integrated darkness: {avg_integrated_darkness}   |   Average area: {avg_area} px   |   Flagged: {flags}/16")
 
-        table = doc.add_table(rows=1, cols=7)
+        table = doc.add_table(rows=1, cols=6)
         table.style = "Table Grid"
         hdr = table.rows[0].cells
-        for i, h in enumerate(["Colony", "Area (px)", "Mean Intensity", "Darkness Score", "Integrated Darkness", "QC", "Notes"]):
+        for i, h in enumerate(["Colony", "Area (px)", "Mean Intensity", "Integrated Darkness", "QC", "Notes"]):
             hdr[i].text = h
             hdr[i].paragraphs[0].runs[0].bold = True
             set_cell_bg(hdr[i], "D9E1F2")
@@ -262,11 +231,10 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf, area_chart_buf, integ
             rc[0].text = c["colony_id"]
             rc[1].text = str(c["area_px"])
             rc[2].text = str(c["mean_intensity"])
-            rc[3].text = str(c["darkness_score"])
-            rc[4].text = str(c["integrated_darkness"])
-            rc[5].text = c["qc_flag"]
-            rc[6].text = c["qc_note"]
-            set_cell_bg(rc[5], "FFD7D7" if c["qc_flag"] == "FLAG" else "D7FFD7")
+            rc[3].text = str(c["integrated_darkness"])
+            rc[4].text = c["qc_flag"]
+            rc[5].text = c["qc_note"]
+            set_cell_bg(rc[4], "FFD7D7" if c["qc_flag"] == "FLAG" else "D7FFD7")
 
         doc.add_paragraph("")
 
@@ -281,9 +249,8 @@ def build_csv(batch_name, batch_data):
     rows = []
     for day in batch_data:
         valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_darkness = round(np.mean([c["darkness_score"] for c in valid]), 2) if valid else 0
+        avg_integrated_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
         avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
-        avg_integ = round(np.mean([c["integrated_darkness"] for c in valid]), 1) if valid else 0
         for c in day["colonies"]:
             rows.append({
                 "batch": batch_name,
@@ -291,27 +258,22 @@ def build_csv(batch_name, batch_data):
                 "colony_id": c["colony_id"],
                 "area_px": c["area_px"],
                 "mean_intensity": c["mean_intensity"],
-                "darkness_score": c["darkness_score"],
                 "integrated_darkness": c["integrated_darkness"],
                 "qc_flag": c["qc_flag"],
                 "qc_note": c["qc_note"],
-                "day_avg_darkness": avg_darkness,
+                "day_avg_integrated_darkness": avg_integrated_darkness,
                 "day_avg_area": avg_area,
-                "day_avg_integrated_darkness": avg_integ,
             })
-        all_darkness = [c["darkness_score"] for c in day["colonies"]]
+        all_integrated_darkness = [c["integrated_darkness"] for c in day["colonies"]]
         all_area = [c["area_px"] for c in day["colonies"]]
-        all_integ = [c["integrated_darkness"] for c in day["colonies"]]
         rows.append({
             "batch": batch_name,
             "date": day["date"].strftime("%Y-%m-%d"),
             "colony_id": "AVERAGE",
             "area_px": round(float(np.mean(all_area)), 1),
-            "darkness_score": round(float(np.mean(all_darkness)), 2),
-            "integrated_darkness": round(float(np.mean(all_integ)), 1),
-            "std_darkness": round(float(np.std(all_darkness)), 2),
+            "integrated_darkness": round(float(np.mean(all_integrated_darkness)), 2),
+            "std_integrated_darkness": round(float(np.std(all_integrated_darkness)), 2),
             "std_area": round(float(np.std(all_area)), 1),
-            "std_integrated_darkness": round(float(np.std(all_integ)), 1),
         })
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
@@ -372,7 +334,7 @@ if run_btn and uploaded_files:
             pil_image = Image.open(file).convert("RGB")
             image_np = np.array(pil_image)
 
-            colonies = detect_colonies(image_np, edge_permissiveness)
+            colonies = detect_colonies(image_np)
 
             # QC
             for c in colonies:
@@ -384,9 +346,8 @@ if run_btn and uploaded_files:
             status.empty()
 
         # ── Generate chart bytes (stored so reruns don't recompute) ──────────
-        dark_chart_bytes = make_chart(batch_data, "darkness_score", "Darkness Score (255 − mean intensity)", batch_name).getvalue()
+        dark_chart_bytes = make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name).getvalue()
         area_chart_bytes = make_chart(batch_data, "area_px", "Colony Area (px)", batch_name).getvalue()
-        integ_chart_bytes = make_chart(batch_data, "integrated_darkness", "Integrated Darkness (Σ 255 − intensity)", batch_name).getvalue()
 
         # ── Summary table (colony averages across all days) ───────────────────
         colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
@@ -394,26 +355,22 @@ if run_btn and uploaded_files:
         for cid in colony_ids:
             d_scores = []
             a_scores = []
-            i_scores = []
             for day in batch_data:
                 match = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
                 if match:
-                    d_scores.append(match["darkness_score"])
+                    d_scores.append(match["integrated_darkness"])
                     a_scores.append(match["area_px"])
-                    i_scores.append(match["integrated_darkness"])
             summary_rows.append({
                 "Colony": cid,
-                "Avg Darkness": round(np.mean(d_scores), 2) if d_scores else 0,
+                "Avg Integrated Darkness": round(np.mean(d_scores), 2) if d_scores else 0,
                 "Avg Area (px)": round(np.mean(a_scores), 1) if a_scores else 0,
-                "Avg Integrated Darkness": round(np.mean(i_scores), 1) if i_scores else 0,
             })
 
         df_sum = pd.DataFrame(summary_rows)
         avg_row = pd.DataFrame([{
             "Colony": "AVERAGE",
-            "Avg Darkness": round(df_sum["Avg Darkness"].mean(), 2),
+            "Avg Integrated Darkness": round(df_sum["Avg Integrated Darkness"].mean(), 2),
             "Avg Area (px)": round(df_sum["Avg Area (px)"].mean(), 1),
-            "Avg Integrated Darkness": round(df_sum["Avg Integrated Darkness"].mean(), 1),
         }])
         df_sum = pd.concat([df_sum, avg_row], ignore_index=True)
 
@@ -421,9 +378,8 @@ if run_btn and uploaded_files:
         csv_bytes = build_csv(batch_name, batch_data)
         word_bytes = build_word_doc(
             batch_name, batch_data,
-            make_chart(batch_data, "darkness_score", "Darkness Score", batch_name),
+            make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name),
             make_chart(batch_data, "area_px", "Colony Area (px)", batch_name),
-            make_chart(batch_data, "integrated_darkness", "Integrated Darkness (Σ 255 − intensity)", batch_name),
         ).getvalue()
 
         batch_results.append({
@@ -431,7 +387,6 @@ if run_btn and uploaded_files:
             "batch_data": batch_data,
             "dark_chart_bytes": dark_chart_bytes,
             "area_chart_bytes": area_chart_bytes,
-            "integ_chart_bytes": integ_chart_bytes,
             "df_summary": df_sum,
             "csv_bytes": csv_bytes,
             "word_bytes": word_bytes,
@@ -448,13 +403,11 @@ if "batch_results" in st.session_state:
 
         st.markdown(f"## Batch {batch_name}")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Darkness Score", use_column_width=True)
+            st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Integrated Darkness", use_column_width=True)
         with col2:
             st.image(result["area_chart_bytes"], caption=f"Batch {batch_name} — Colony Area", use_column_width=True)
-        with col3:
-            st.image(result["integ_chart_bytes"], caption=f"Batch {batch_name} — Integrated Darkness", use_column_width=True)
 
         st.markdown(f"#### Colony Averages — Batch {batch_name}")
         st.dataframe(result["df_summary"], use_container_width=True, hide_index=True)
