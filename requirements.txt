@@ -3,5 +3,5 @@ opencv-python-headless
 numpy
 pandas
 matplotlib
-Pillow
+pillow
 python-docx
