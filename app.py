@@ -138,58 +138,38 @@ def run_qc(colony):
     return ("FLAG" if flags else "OK"), "; ".join(flags)
 
 # ── Chart builder ─────────────────────────────────────────────────────────────
-def make_chart(batch_data, metric, metric_label, batch_name, normalize=False):
+def make_chart(batch_data, metric, metric_label, batch_name):
     """
     batch_data: list of {date, colonies: [{colony_id, area_px, integrated_darkness, ...}]}
     metric: colony dict key to plot, e.g. 'integrated_darkness'
-    normalize: if True, each colony's series is divided by its own first-day
-               value, so every line starts at 1.0 and shows fold-growth
-               relative to Day 1. This keeps Integrated Darkness as the
-               underlying metric while making per-colony growth trends visible
-               regardless of absolute colony size.
+    Plots absolute per-colony values (no normalization) against true elapsed
+    days since the first timepoint, so uneven gaps between imaging dates are
+    shown to scale. Each faint line is one of the 16 colonies.
     Returns matplotlib figure as BytesIO PNG
     """
-    dates = [d["date"] for d in batch_data]
-    date_labels = [d.strftime("%b %d") for d in dates]
+    # True elapsed days since the first timepoint (handles uneven date gaps)
+    first_date = batch_data[0]["date"]
+    days_since = [(d["date"] - first_date).days for d in batch_data]
 
     colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
-    colors = cm.tab20(np.linspace(0, 1, 16))
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    all_values = []
-    for i, cid in enumerate(colony_ids):
+    for cid in colony_ids:
         values = []
         for day in batch_data:
             colony = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
-            values.append(float(colony[metric]) if colony else 0.0)
+            # Missing/undetected colony -> NaN leaves a gap instead of a false 0 dip
+            values.append(float(colony[metric]) if colony and colony.get("area_px", 0) > 0 else np.nan)
+        ax.plot(days_since, values, color="#4a9d4a", alpha=0.5, linewidth=1.3,
+                marker="o", markersize=4)
 
-        if normalize:
-            baseline = values[0]
-            if baseline > 0:
-                # fold-change relative to Day 1 (Day 1 == 1.0)
-                values = [v / baseline for v in values]
-            else:
-                # Colony absent/zero on Day 1 — can't form a ratio; hide the line
-                values = [np.nan for _ in values]
-
-        ax.plot(date_labels, values, color=colors[i], alpha=0.4, linewidth=1.2, label=cid)
-        all_values.append(values)
-
-    # Average line (ignore colonies that are NaN because they had no Day-1 baseline)
-    avg_values = np.nanmean(all_values, axis=0)
-    ax.plot(date_labels, avg_values, color="black", linewidth=2.5, label="Average", zorder=5)
-
-    if normalize:
-        # Reference line at 1.0 = the Day-1 starting point
-        ax.axhline(1.0, color="gray", linestyle="--", linewidth=1, alpha=0.6, zorder=1)
-        ax.set_title(f"Batch {batch_name} — {metric_label} (Relative to Day 1)", fontsize=13, fontweight="bold")
-        ax.set_ylabel(f"{metric_label}\n(fold-change vs Day 1)")
-    else:
-        ax.set_title(f"Batch {batch_name} — {metric_label} Over Time", fontsize=13, fontweight="bold")
-        ax.set_ylabel(metric_label)
-    ax.set_xlabel("Date")
-    ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=7, ncol=1)
+    ax.set_title(
+        f"Batch {batch_name} — Per-colony growth\n{metric_label} (a.u.), each line = one of 16 colonies",
+        fontsize=12, fontweight="bold")
+    ax.set_xlabel("Days since first timepoint")
+    ax.set_ylabel(f"{metric_label} (a.u.)")
+    ax.set_xticks(sorted(set(days_since)))
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
@@ -366,7 +346,7 @@ if run_btn and uploaded_files:
             status.empty()
 
         # ── Generate chart bytes (stored so reruns don't recompute) ──────────
-        dark_chart_bytes = make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name, normalize=True).getvalue()
+        dark_chart_bytes = make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name).getvalue()
 
         # ── Summary table (colony averages across all days) ───────────────────
         colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
@@ -397,7 +377,7 @@ if run_btn and uploaded_files:
         csv_bytes = build_csv(batch_name, batch_data)
         word_bytes = build_word_doc(
             batch_name, batch_data,
-            make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name, normalize=True),
+            make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name),
         ).getvalue()
 
         batch_results.append({
