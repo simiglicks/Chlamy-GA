@@ -18,7 +18,7 @@ from docx.oxml import OxmlElement
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Colony Analyzer", page_icon="🔬", layout="wide")
 st.title("🔬 Colony Plate Analyzer")
-st.markdown("Upload all plate images at once. Images are grouped by batch letter and sorted by date automatically. This version keeps the original mean-darkness signal and adds normalized growth curves.")
+st.markdown("Upload all plate images at once. Images are grouped by batch letter and sorted by date automatically.")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -49,7 +49,9 @@ def detect_colonies(image_np):
     3. Filter out blobs smaller than min_area (splashes)
     4. Take the 16 largest remaining blobs
     5. Sort into 4x4 grid by position (row then col)
-    Returns list of 16 dicts with position, centroid, bbox, area, mean_intensity, darkness_score
+    Returns list of 16 dicts with position, centroid, bbox, area, mean_intensity,
+    darkness_score (legacy mean-based, kept for QC/compatibility), and
+    integrated_darkness (primary growth metric).
     """
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
 
@@ -81,6 +83,13 @@ def detect_colonies(image_np):
         mean_intensity = float(cv2.mean(gray, mask=blob_mask)[0])
         darkness_score = round(255 - mean_intensity, 2)
 
+        # Integrated darkness: sum of per-pixel darkness (255 - intensity) over
+        # every pixel inside the colony mask, using original grayscale values.
+        # Boolean-index the grayscale image (not the binary mask values) and
+        # cast to a signed type before subtraction to avoid uint8 wraparound.
+        mask_bool = labels == label_idx
+        integrated_darkness = int(np.sum(255 - gray[mask_bool].astype(np.int32)))
+
         colonies.append({
             "area_px": area,
             "cx": float(cx),
@@ -88,6 +97,7 @@ def detect_colonies(image_np):
             "bbox": (x, y, w, h),
             "mean_intensity": round(mean_intensity, 2),
             "darkness_score": darkness_score,
+            "integrated_darkness": integrated_darkness,
         })
 
     # Take 16 largest
@@ -98,7 +108,8 @@ def detect_colonies(image_np):
         while len(colonies) < 16:
             colonies.append({
                 "area_px": 0, "cx": 0.0, "cy": 0.0, "bbox": (0,0,0,0),
-                "mean_intensity": 255.0, "darkness_score": 0.0, "normalized_growth": 0.0
+                "mean_intensity": 255.0, "darkness_score": 0.0,
+                "integrated_darkness": 0
             })
 
     # Sort into 4x4 grid: sort by Y (row) then X (col)
@@ -126,53 +137,11 @@ def run_qc(colony):
         flags.append("very low darkness — possible empty spot")
     return ("FLAG" if flags else "OK"), "; ".join(flags)
 
-
-# ── Growth normalization ─────────────────────────────────────────────────────
-def add_normalized_growth(batch_data):
-    """
-    Add a normalized growth value for each colony based on the original darkness_score.
-
-    The original mean-darkness signal produced the expected growth-curve shape.
-    This normalized version keeps that signal, but rescales each colony from its
-    first day toward the theoretical maximum darkness of 255:
-
-        normalized_growth = (darkness_today - darkness_day_1) / (255 - darkness_day_1)
-
-    This makes the curve easier to see without using unreliable area-derived metrics.
-    Values are clipped to 0-1. Missing/invalid baselines are handled safely.
-    """
-    if not batch_data:
-        return batch_data
-
-    colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
-    baseline_by_colony = {}
-
-    for cid in colony_ids:
-        baseline = None
-        for day in batch_data:
-            match = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
-            if match and match.get("area_px", 0) > 0:
-                baseline = float(match.get("darkness_score", 0.0))
-                break
-        baseline_by_colony[cid] = baseline
-
-    for day in batch_data:
-        for colony in day["colonies"]:
-            cid = colony["colony_id"]
-            baseline = baseline_by_colony.get(cid)
-            current = float(colony.get("darkness_score", 0.0))
-            if baseline is None or baseline >= 254.9:
-                colony["normalized_growth"] = 0.0
-            else:
-                value = (current - baseline) / (255.0 - baseline)
-                colony["normalized_growth"] = round(float(np.clip(value, 0.0, 1.0)), 4)
-    return batch_data
-
 # ── Chart builder ─────────────────────────────────────────────────────────────
 def make_chart(batch_data, metric, metric_label, batch_name):
     """
-    batch_data: list of {date, colonies: [{colony_id, area_px, darkness_score, ...}]}
-    metric: 'darkness_score' or 'area_px'
+    batch_data: list of {date, colonies: [{colony_id, area_px, integrated_darkness, ...}]}
+    metric: colony dict key to plot, e.g. 'integrated_darkness'
     Returns matplotlib figure as BytesIO PNG
     """
     dates = [d["date"] for d in batch_data]
@@ -221,7 +190,7 @@ def set_cell_bg(cell, hex_color):
     tcPr.append(shd)
 
 
-def build_word_doc(batch_name, batch_data, growth_chart_buf, dark_chart_buf, area_chart_buf):
+def build_word_doc(batch_name, batch_data, dark_chart_buf):
     doc = Document()
     title = doc.add_heading(f"Colony Analysis Report — Batch {batch_name}", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -231,19 +200,9 @@ def build_word_doc(batch_name, batch_data, growth_chart_buf, dark_chart_buf, are
     doc.add_paragraph("")
 
     # Charts
-    doc.add_heading("Normalized Growth Over Time", level=1)
-    growth_chart_buf.seek(0)
-    doc.add_picture(growth_chart_buf, width=Inches(6))
-    doc.add_paragraph("")
-
-    doc.add_heading("Original Mean Darkness Score Over Time", level=1)
+    doc.add_heading("Integrated Darkness Over Time", level=1)
     dark_chart_buf.seek(0)
     doc.add_picture(dark_chart_buf, width=Inches(6))
-    doc.add_paragraph("")
-
-    doc.add_heading("Colony Area Over Time", level=1)
-    area_chart_buf.seek(0)
-    doc.add_picture(area_chart_buf, width=Inches(6))
     doc.add_paragraph("")
 
     # Per-day tables
@@ -253,15 +212,15 @@ def build_word_doc(batch_name, batch_data, growth_chart_buf, dark_chart_buf, are
 
         # Average row
         valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_darkness = round(np.mean([c["darkness_score"] for c in valid]), 2) if valid else 0
+        avg_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
         avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
         flags = sum(1 for c in day["colonies"] if c["qc_flag"] == "FLAG")
-        doc.add_paragraph(f"Average darkness: {avg_darkness}   |   Average area: {avg_area} px   |   Flagged: {flags}/16")
+        doc.add_paragraph(f"Average integrated darkness: {avg_darkness}   |   Average area: {avg_area} px   |   Flagged: {flags}/16")
 
-        table = doc.add_table(rows=1, cols=7)
+        table = doc.add_table(rows=1, cols=6)
         table.style = "Table Grid"
         hdr = table.rows[0].cells
-        for i, h in enumerate(["Colony", "Area (px)", "Mean Intensity", "Darkness Score", "Normalized Growth", "QC", "Notes"]):
+        for i, h in enumerate(["Colony", "Area (px)", "Mean Intensity", "Integrated Darkness", "QC", "Notes"]):
             hdr[i].text = h
             hdr[i].paragraphs[0].runs[0].bold = True
             set_cell_bg(hdr[i], "D9E1F2")
@@ -271,11 +230,10 @@ def build_word_doc(batch_name, batch_data, growth_chart_buf, dark_chart_buf, are
             rc[0].text = c["colony_id"]
             rc[1].text = str(c["area_px"])
             rc[2].text = str(c["mean_intensity"])
-            rc[3].text = str(c["darkness_score"])
-            rc[4].text = str(c.get("normalized_growth", 0.0))
-            rc[5].text = c["qc_flag"]
-            rc[6].text = c["qc_note"]
-            set_cell_bg(rc[5], "FFD7D7" if c["qc_flag"] == "FLAG" else "D7FFD7")
+            rc[3].text = str(c["integrated_darkness"])
+            rc[4].text = c["qc_flag"]
+            rc[5].text = c["qc_note"]
+            set_cell_bg(rc[4], "FFD7D7" if c["qc_flag"] == "FLAG" else "D7FFD7")
 
         doc.add_paragraph("")
 
@@ -290,7 +248,7 @@ def build_csv(batch_name, batch_data):
     rows = []
     for day in batch_data:
         valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_darkness = round(np.mean([c["darkness_score"] for c in valid]), 2) if valid else 0
+        avg_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
         avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
         for c in day["colonies"]:
             rows.append({
@@ -299,23 +257,21 @@ def build_csv(batch_name, batch_data):
                 "colony_id": c["colony_id"],
                 "area_px": c["area_px"],
                 "mean_intensity": c["mean_intensity"],
-                "darkness_score": c["darkness_score"],
-                "normalized_growth": c.get("normalized_growth", 0.0),
+                "integrated_darkness": c["integrated_darkness"],
                 "qc_flag": c["qc_flag"],
                 "qc_note": c["qc_note"],
-                "day_avg_darkness": avg_darkness,
+                "day_avg_integrated_darkness": avg_darkness,
                 "day_avg_area": avg_area,
             })
-        all_darkness = [c["darkness_score"] for c in day["colonies"]]
+        all_darkness = [c["integrated_darkness"] for c in day["colonies"]]
         all_area = [c["area_px"] for c in day["colonies"]]
         rows.append({
             "batch": batch_name,
             "date": day["date"].strftime("%Y-%m-%d"),
             "colony_id": "AVERAGE",
             "area_px": round(float(np.mean(all_area)), 1),
-            "darkness_score": round(float(np.mean(all_darkness)), 2),
-            "std_darkness": round(float(np.std(all_darkness)), 2),
-            "avg_normalized_growth": round(float(np.mean([c.get("normalized_growth", 0.0) for c in day["colonies"]])), 4),
+            "integrated_darkness": round(float(np.mean(all_darkness)), 2),
+            "std_integrated_darkness": round(float(np.std(all_darkness)), 2),
             "std_area": round(float(np.std(all_area)), 1),
         })
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
@@ -388,13 +344,8 @@ if run_btn and uploaded_files:
             progress.progress(processed / total_images)
             status.empty()
 
-        # Normalize the original darkness signal after all days in this batch are processed.
-        batch_data = add_normalized_growth(batch_data)
-
         # ── Generate chart bytes (stored so reruns don't recompute) ──────────
-        growth_chart_bytes = make_chart(batch_data, "normalized_growth", "Normalized Growth (original darkness, baseline to max)", batch_name).getvalue()
-        dark_chart_bytes = make_chart(batch_data, "darkness_score", "Original Mean Darkness Score (255 − mean intensity)", batch_name).getvalue()
-        area_chart_bytes = make_chart(batch_data, "area_px", "Colony Area (px)", batch_name).getvalue()
+        dark_chart_bytes = make_chart(batch_data, "integrated_darkness", "Integrated Darkness (Σ 255 − intensity)", batch_name).getvalue()
 
         # ── Summary table (colony averages across all days) ───────────────────
         colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
@@ -402,25 +353,21 @@ if run_btn and uploaded_files:
         for cid in colony_ids:
             d_scores = []
             a_scores = []
-            g_scores = []
             for day in batch_data:
                 match = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
                 if match:
-                    d_scores.append(match["darkness_score"])
+                    d_scores.append(match["integrated_darkness"])
                     a_scores.append(match["area_px"])
-                    g_scores.append(match.get("normalized_growth", 0.0))
             summary_rows.append({
                 "Colony": cid,
-                "Avg Normalized Growth": round(np.mean(g_scores), 4) if g_scores else 0,
-                "Avg Darkness": round(np.mean(d_scores), 2) if d_scores else 0,
+                "Avg Integrated Darkness": round(np.mean(d_scores), 2) if d_scores else 0,
                 "Avg Area (px)": round(np.mean(a_scores), 1) if a_scores else 0,
             })
 
         df_sum = pd.DataFrame(summary_rows)
         avg_row = pd.DataFrame([{
             "Colony": "AVERAGE",
-            "Avg Normalized Growth": round(df_sum["Avg Normalized Growth"].mean(), 4),
-            "Avg Darkness": round(df_sum["Avg Darkness"].mean(), 2),
+            "Avg Integrated Darkness": round(df_sum["Avg Integrated Darkness"].mean(), 2),
             "Avg Area (px)": round(df_sum["Avg Area (px)"].mean(), 1),
         }])
         df_sum = pd.concat([df_sum, avg_row], ignore_index=True)
@@ -429,17 +376,13 @@ if run_btn and uploaded_files:
         csv_bytes = build_csv(batch_name, batch_data)
         word_bytes = build_word_doc(
             batch_name, batch_data,
-            make_chart(batch_data, "normalized_growth", "Normalized Growth", batch_name),
-            make_chart(batch_data, "darkness_score", "Original Mean Darkness Score", batch_name),
-            make_chart(batch_data, "area_px", "Colony Area (px)", batch_name),
+            make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name),
         ).getvalue()
 
         batch_results.append({
             "batch_name": batch_name,
             "batch_data": batch_data,
-            "growth_chart_bytes": growth_chart_bytes,
             "dark_chart_bytes": dark_chart_bytes,
-            "area_chart_bytes": area_chart_bytes,
             "df_summary": df_sum,
             "csv_bytes": csv_bytes,
             "word_bytes": word_bytes,
@@ -456,14 +399,7 @@ if "batch_results" in st.session_state:
 
         st.markdown(f"## Batch {batch_name}")
 
-        st.info("Recommended first graph to inspect: Normalized Growth. It preserves the original mean-darkness signal that matched your expected growth curve, but rescales each colony from its first day toward maximum darkness so the curve shape is easier to see.")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.image(result["growth_chart_bytes"], caption=f"Batch {batch_name} — Normalized Growth", use_column_width=True)
-        with col2:
-            st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Original Mean Darkness", use_column_width=True)
-        with col3:
-            st.image(result["area_chart_bytes"], caption=f"Batch {batch_name} — Colony Area (QC only)", use_column_width=True)
+        st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Integrated Darkness", use_column_width=True)
 
         st.markdown(f"#### Colony Averages — Batch {batch_name}")
         st.dataframe(result["df_summary"], use_container_width=True, hide_index=True)
