@@ -1,7 +1,8 @@
 streamlit
-opencv-python-headless
 numpy
 pandas
 matplotlib
-pillow
+tifffile
+scikit-image
+scipy
 python-docx
