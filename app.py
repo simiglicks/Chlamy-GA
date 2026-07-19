@@ -1,34 +1,58 @@
-import streamlit as st
-import cv2
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 import io
 import re
-from datetime import datetime
 from collections import defaultdict
-from PIL import Image
-from docx import Document
-from docx.shared import Inches, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+from datetime import datetime
 
-# ── Page config ───────────────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+import tifffile
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches
+from scipy.cluster.vq import kmeans2
+from skimage import filters, measure, morphology
+
+# ── Tunable detection constants ──────────────────────────────────────────────
+BG_SIGMA = 40        # gaussian sigma for local background estimation
+SIGNAL_THRESH = 200  # darkness signal threshold (raw 16-bit units)
+MIN_BLOB_PX = 100    # blobs smaller than this are splash artifacts
+N_ROWS, N_COLS = 4, 4
+
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Colony Analyzer", page_icon="🔬", layout="wide")
 st.title("🔬 Colony Plate Analyzer")
-st.markdown("Upload all plate images at once. Images are grouped by batch letter and sorted by date automatically.")
+st.markdown(
+    "Upload all plate images at once. Images are grouped by batch letter and "
+    "sorted by date automatically."
+)
+st.warning(
+    "**Upload the original 16-bit TIFF files straight from the gel imager.** "
+    "PNG or JPG exports crush the dynamic range and destroy the measurement "
+    "signal — colony values computed from them are not valid."
+)
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    st.markdown("**Filename format:** `A20260611.jpg` → Batch A, June 11 2026")
+    st.markdown("**Filename format:** `A20260611.tif` → Batch A, June 11 2026")
+    st.markdown("**Image format:** one cropped 4×4 grid per image, 16-bit TIFF")
     st.markdown("---")
-    st.markdown("**How to use:**\n1. Upload all images\n2. Click Analyze\n3. Download results per batch")
+    st.markdown(
+        "**How to use:**\n"
+        "1. Upload all images\n"
+        "2. Click Analyze\n"
+        "3. Download results per batch"
+    )
 
-# ── Filename parser ───────────────────────────────────────────────────────────
+
+# ── Filename parser ──────────────────────────────────────────────────────────
 def parse_filename(filename):
-    """Extract batch letter and date from e.g. A20260611.jpg"""
+    """Extract batch letter and date from e.g. A20260611.tif"""
     name = filename.rsplit(".", 1)[0]
     match = re.match(r"^([A-Za-z]+)(\d{8})$", name)
     if not match:
@@ -40,136 +64,160 @@ def parse_filename(filename):
         return None, None
     return batch, date
 
-# ── Colony detection ──────────────────────────────────────────────────────────
-def detect_colonies(image_np):
+
+# ── Image loading (full bit depth preserved) ─────────────────────────────────
+def load_gray(file_bytes):
     """
-    Find exactly 16 colonies:
-    1. Convert to grayscale, even out lighting
-    2. Threshold to find dark blobs
-    3. Filter out blobs smaller than min_area (splashes)
-    4. Take the 16 largest remaining blobs
-    5. Sort into 4x4 grid by position (row then col)
-    Returns list of 16 dicts with position, centroid, bbox, area, mean_intensity,
-    darkness_score (legacy mean-based, kept for QC/compatibility), and
-    integrated_darkness (primary growth metric).
+    Read an image at its native bit depth and return a float64 grayscale array.
+
+    Critically this does NOT convert to uint8. The source TIFFs span roughly
+    0-5000 in 16-bit units; casting to uint8 collapses them into ~5 brightness
+    levels and destroys the colony signal entirely.
     """
-    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    img = tifffile.imread(io.BytesIO(file_bytes))
+    arr = np.asarray(img)
+    if arr.ndim == 3:
+        arr = arr.max(axis=2)
+    return arr.astype(np.float64)
 
-    # Even out uneven lighting
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_eq = clahe.apply(gray)
 
-    # Threshold — colonies are dark on light background
-    _, thresh = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+# ── Colony detection and measurement ─────────────────────────────────────────
+def detect_colonies(gray):
+    """
+    Measure 16 colonies from a single cropped 4x4 grid image.
 
-    # Morphological closing to fill holes in colonies
-    kernel = np.ones((5, 5), np.uint8)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    1. Local background via large gaussian blur; signal = bg - gray, so a pixel
+       is "dark" relative to its own neighbourhood. Cancels vignetting and
+       uneven illumination, which a single global background value cannot.
+    2. Threshold the signal image (not the raw image) to find blobs.
+    3. Keep the 16 largest blobs. Later timepoints legitimately produce extra
+       stray blobs, so this selection matters.
+    4. Fit a 4x4 lattice by clustering row- and column-coordinates independently
+       with k-means. Robust to stray blobs, unlike sort-and-chunk, which
+       mis-assigns every colony after a single misplaced point.
+    5. Integrate the darkness signal pixel by pixel within each colony mask.
 
-    # Find blobs
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+    Returns a list of 16 dicts sorted R1C1..R4C4.
+    """
+    bg = filters.gaussian(gray, sigma=BG_SIGMA)
+    signal = bg - gray
+
+    smask = signal > SIGNAL_THRESH
+    smask = morphology.remove_small_objects(smask, MIN_BLOB_PX)
+    smask = morphology.closing(smask, morphology.disk(3))
+
+    labels = measure.label(smask)
+    props = measure.regionprops(labels, intensity_image=signal)
+    props = sorted(props, key=lambda p: p.area, reverse=True)[: N_ROWS * N_COLS]
+
+    if len(props) < 2:
+        return [], signal, 0
+
+    centroids = np.array([p.centroid for p in props], dtype=float)
+
+    # Fit the lattice: cluster rows and columns independently.
+    k_rows = min(N_ROWS, len(props))
+    k_cols = min(N_COLS, len(props))
+    row_centers, _ = kmeans2(centroids[:, 0], k_rows, minit="++", seed=1)
+    col_centers, _ = kmeans2(centroids[:, 1], k_cols, minit="++", seed=1)
+    row_centers = np.sort(row_centers)
+    col_centers = np.sort(col_centers)
 
     colonies = []
-    for label_idx in range(1, num_labels):  # skip background (0)
-        area = int(stats[label_idx, cv2.CC_STAT_AREA])
-        x = int(stats[label_idx, cv2.CC_STAT_LEFT])
-        y = int(stats[label_idx, cv2.CC_STAT_TOP])
-        w = int(stats[label_idx, cv2.CC_STAT_WIDTH])
-        h = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
-        cx, cy = centroids[label_idx]
+    for prop, (cy, cx) in zip(props, centroids):
+        r_idx = int(np.argmin(np.abs(row_centers - cy)))
+        c_idx = int(np.argmin(np.abs(col_centers - cx)))
+        mask = labels == prop.label
+        colonies.append(
+            {
+                "colony_id": f"R{r_idx + 1}C{c_idx + 1}",
+                "row": r_idx,
+                "col": c_idx,
+                "cy": float(cy),
+                "cx": float(cx),
+                "area_px": int(prop.area),
+                "integrated_darkness": float(signal[mask].sum()),
+                "mean_darkness": float(signal[mask].mean()),
+            }
+        )
 
-        # Mean intensity from original (non-equalized) image within the blob mask
-        blob_mask = (labels == label_idx).astype(np.uint8)
-        mean_intensity = float(cv2.mean(gray, mask=blob_mask)[0])
-        darkness_score = round(255 - mean_intensity, 2)
+    # Fill any lattice position that received no blob, so the table always has
+    # a complete 4x4 and downstream code can rely on the colony_id set.
+    found = {c["colony_id"] for c in colonies}
+    for r in range(N_ROWS):
+        for c in range(N_COLS):
+            cid = f"R{r + 1}C{c + 1}"
+            if cid not in found:
+                colonies.append(
+                    {
+                        "colony_id": cid,
+                        "row": r,
+                        "col": c,
+                        "cy": 0.0,
+                        "cx": 0.0,
+                        "area_px": 0,
+                        "integrated_darkness": 0.0,
+                        "mean_darkness": 0.0,
+                    }
+                )
 
-        # Integrated darkness: sum of per-pixel darkness (255 - intensity) over
-        # every pixel inside the colony mask, using original grayscale values.
-        # Boolean-index the grayscale image (not the binary mask values) and
-        # cast to a signed type before subtraction to avoid uint8 wraparound.
-        mask_bool = labels == label_idx
-        integrated_darkness = int(np.sum(255 - gray[mask_bool].astype(np.int32)))
+    colonies.sort(key=lambda c: (c["row"], c["col"]))
+    return colonies, signal, len(props)
 
-        colonies.append({
-            "area_px": area,
-            "cx": float(cx),
-            "cy": float(cy),
-            "bbox": (x, y, w, h),
-            "mean_intensity": round(mean_intensity, 2),
-            "darkness_score": darkness_score,
-            "integrated_darkness": integrated_darkness,
-        })
 
-    # Take 16 largest
-    colonies = sorted(colonies, key=lambda c: c["area_px"], reverse=True)[:16]
-
-    if len(colonies) < 16:
-        # Pad missing colonies with zeros
-        while len(colonies) < 16:
-            colonies.append({
-                "area_px": 0, "cx": 0.0, "cy": 0.0, "bbox": (0,0,0,0),
-                "mean_intensity": 255.0, "darkness_score": 0.0,
-                "integrated_darkness": 0
-            })
-
-    # Sort into 4x4 grid: sort by Y (row) then X (col)
-    colonies = sorted(colonies, key=lambda c: (c["cy"], c["cx"]))
-    rows = []
-    for i in range(4):
-        row = sorted(colonies[i*4:(i+1)*4], key=lambda c: c["cx"])
-        rows.append(row)
-
-    # Assign grid labels
-    result = []
-    for r_idx, row in enumerate(rows):
-        for c_idx, colony in enumerate(row):
-            colony["colony_id"] = f"R{r_idx+1}C{c_idx+1}"
-            result.append(colony)
-
-    return result
-
-# ── QC checks ─────────────────────────────────────────────────────────────────
-def run_qc(colony):
+# ── QC checks ────────────────────────────────────────────────────────────────
+def run_qc(colony, all_colonies):
     flags = []
     if colony["area_px"] == 0:
-        flags.append("colony not detected")
-    if colony["darkness_score"] < 5:
-        flags.append("very low darkness — possible empty spot")
+        flags.append("colony not detected at this lattice position")
+    dupes = [c for c in all_colonies if c["colony_id"] == colony["colony_id"]]
+    if len(dupes) > 1:
+        flags.append("duplicate lattice assignment")
     return ("FLAG" if flags else "OK"), "; ".join(flags)
 
-# ── Chart builder ─────────────────────────────────────────────────────────────
+
+# ── Chart builder ────────────────────────────────────────────────────────────
 def make_chart(batch_data, metric, metric_label, batch_name):
-    """
-    batch_data: list of {date, colonies: [{colony_id, area_px, integrated_darkness, ...}]}
-    metric: colony dict key to plot, e.g. 'integrated_darkness'
-    Plots absolute per-colony values (no normalization) against true elapsed
-    days since the first timepoint, so uneven gaps between imaging dates are
-    shown to scale. Each faint line is one of the 16 colonies.
-    Returns matplotlib figure as BytesIO PNG
-    """
-    # True elapsed days since the first timepoint (handles uneven date gaps)
+    """Per-colony traces plus a bold mean line, against true elapsed days."""
     first_date = batch_data[0]["date"]
     days_since = [(d["date"] - first_date).days for d in batch_data]
-
     colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
+    series = []
     for cid in colony_ids:
         values = []
         for day in batch_data:
-            colony = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
-            # Missing/undetected colony -> NaN leaves a gap instead of a false 0 dip
-            values.append(float(colony[metric]) if colony and colony.get("area_px", 0) > 0 else np.nan)
-        ax.plot(days_since, values, color="#4a9d4a", alpha=0.5, linewidth=1.3,
-                marker="o", markersize=4)
+            colony = next(
+                (c for c in day["colonies"] if c["colony_id"] == cid), None
+            )
+            values.append(
+                float(colony[metric])
+                if colony and colony["area_px"] > 0
+                else np.nan
+            )
+        series.append(values)
+        ax.plot(
+            days_since, values, color="#4a9d4a", alpha=0.45, linewidth=1.2,
+            marker="o", markersize=3,
+        )
+
+    mean_vals = np.nanmean(np.array(series, dtype=float), axis=0)
+    ax.plot(
+        days_since, mean_vals, color="black", linewidth=2.5, marker="o",
+        markersize=5, label="Mean of 16 colonies", zorder=5,
+    )
 
     ax.set_title(
-        f"Batch {batch_name} — Per-colony growth\n{metric_label} (a.u.), each line = one of 16 colonies",
-        fontsize=12, fontweight="bold")
+        f"Batch {batch_name} — per-colony growth\n"
+        f"{metric_label}, each thin line = one of 16 colonies",
+        fontsize=12, fontweight="bold",
+    )
     ax.set_xlabel("Days since first timepoint")
     ax.set_ylabel(f"{metric_label} (a.u.)")
     ax.set_xticks(sorted(set(days_since)))
+    ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
@@ -180,10 +228,9 @@ def make_chart(batch_data, metric, metric_label, batch_name):
     return buf
 
 
-# ── Word doc ──────────────────────────────────────────────────────────────────
+# ── Word doc ─────────────────────────────────────────────────────────────────
 def set_cell_bg(cell, hex_color):
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
+    tcPr = cell._tc.get_or_add_tcPr()
     shd = OxmlElement("w:shd")
     shd.set(qn("w:val"), "clear")
     shd.set(qn("w:color"), "auto")
@@ -191,37 +238,45 @@ def set_cell_bg(cell, hex_color):
     tcPr.append(shd)
 
 
-def build_word_doc(batch_name, batch_data, dark_chart_buf):
+def build_word_doc(batch_name, batch_data, chart_bufs):
     doc = Document()
     title = doc.add_heading(f"Colony Analysis Report — Batch {batch_name}", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     dates_str = ", ".join(d["date"].strftime("%b %d %Y") for d in batch_data)
     doc.add_paragraph(f"Dates analyzed: {dates_str}")
-    doc.add_paragraph(f"Colonies per plate: 16 (4×4 grid, technical replicates)")
+    doc.add_paragraph("Colonies per plate: 16 (4×4 grid, technical replicates)")
+    doc.add_paragraph(
+        "Integrated darkness = sum of local-background-subtracted darkness "
+        "over every pixel of a colony. Computed on 16-bit source data."
+    )
     doc.add_paragraph("")
 
-    # Charts
-    doc.add_heading("Integrated Darkness Over Time", level=1)
-    dark_chart_buf.seek(0)
-    doc.add_picture(dark_chart_buf, width=Inches(6))
-    doc.add_paragraph("")
+    for heading, buf in chart_bufs:
+        doc.add_heading(heading, level=1)
+        buf.seek(0)
+        doc.add_picture(buf, width=Inches(6))
+        doc.add_paragraph("")
 
-    # Per-day tables
     doc.add_heading("Raw Data Per Day", level=1)
     for day in batch_data:
         doc.add_heading(day["date"].strftime("%B %d, %Y"), level=2)
 
-        # Average row
         valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
-        avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
+        avg_id = np.mean([c["integrated_darkness"] for c in valid]) if valid else 0
+        avg_area = np.mean([c["area_px"] for c in valid]) if valid else 0
         flags = sum(1 for c in day["colonies"] if c["qc_flag"] == "FLAG")
-        doc.add_paragraph(f"Average integrated darkness: {avg_darkness}   |   Average area: {avg_area} px   |   Flagged: {flags}/16")
+        doc.add_paragraph(
+            f"Mean integrated darkness: {avg_id:,.0f}   |   "
+            f"Mean area: {avg_area:,.0f} px   |   Flagged: {flags}/16"
+        )
 
         table = doc.add_table(rows=1, cols=6)
         table.style = "Table Grid"
         hdr = table.rows[0].cells
-        for i, h in enumerate(["Colony", "Area (px)", "Mean Intensity", "Integrated Darkness", "QC", "Notes"]):
+        for i, h in enumerate(
+            ["Colony", "Area (px)", "Integrated Darkness", "Mean Darkness",
+             "QC", "Notes"]
+        ):
             hdr[i].text = h
             hdr[i].paragraphs[0].runs[0].bold = True
             set_cell_bg(hdr[i], "D9E1F2")
@@ -229,9 +284,9 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf):
         for c in day["colonies"]:
             rc = table.add_row().cells
             rc[0].text = c["colony_id"]
-            rc[1].text = str(c["area_px"])
-            rc[2].text = str(c["mean_intensity"])
-            rc[3].text = str(c["integrated_darkness"])
+            rc[1].text = f"{c['area_px']:,}"
+            rc[2].text = f"{c['integrated_darkness']:,.0f}"
+            rc[3].text = f"{c['mean_darkness']:,.1f}"
             rc[4].text = c["qc_flag"]
             rc[5].text = c["qc_note"]
             set_cell_bg(rc[4], "FFD7D7" if c["qc_flag"] == "FLAG" else "D7FFD7")
@@ -244,55 +299,59 @@ def build_word_doc(batch_name, batch_data, dark_chart_buf):
     return buf
 
 
-# ── CSV builder ───────────────────────────────────────────────────────────────
+# ── CSV builder ──────────────────────────────────────────────────────────────
 def build_csv(batch_name, batch_data):
     rows = []
     for day in batch_data:
-        valid = [c for c in day["colonies"] if c["area_px"] > 0]
-        avg_darkness = round(np.mean([c["integrated_darkness"] for c in valid]), 2) if valid else 0
-        avg_area = round(np.mean([c["area_px"] for c in valid]), 1) if valid else 0
+        date_str = day["date"].strftime("%Y-%m-%d")
         for c in day["colonies"]:
-            rows.append({
+            rows.append(
+                {
+                    "batch": batch_name,
+                    "date": date_str,
+                    "colony_id": c["colony_id"],
+                    "area_px": c["area_px"],
+                    "integrated_darkness": round(c["integrated_darkness"], 2),
+                    "mean_darkness": round(c["mean_darkness"], 2),
+                    "qc_flag": c["qc_flag"],
+                    "qc_note": c["qc_note"],
+                }
+            )
+        ids = [c["integrated_darkness"] for c in day["colonies"]]
+        areas = [c["area_px"] for c in day["colonies"]]
+        rows.append(
+            {
                 "batch": batch_name,
-                "date": day["date"].strftime("%Y-%m-%d"),
-                "colony_id": c["colony_id"],
-                "area_px": c["area_px"],
-                "mean_intensity": c["mean_intensity"],
-                "integrated_darkness": c["integrated_darkness"],
-                "qc_flag": c["qc_flag"],
-                "qc_note": c["qc_note"],
-                "day_avg_integrated_darkness": avg_darkness,
-                "day_avg_area": avg_area,
-            })
-        all_darkness = [c["integrated_darkness"] for c in day["colonies"]]
-        all_area = [c["area_px"] for c in day["colonies"]]
-        rows.append({
-            "batch": batch_name,
-            "date": day["date"].strftime("%Y-%m-%d"),
-            "colony_id": "AVERAGE",
-            "area_px": round(float(np.mean(all_area)), 1),
-            "integrated_darkness": round(float(np.mean(all_darkness)), 2),
-            "std_integrated_darkness": round(float(np.std(all_darkness)), 2),
-            "std_area": round(float(np.std(all_area)), 1),
-        })
+                "date": date_str,
+                "colony_id": "AVERAGE",
+                "area_px": round(float(np.mean(areas)), 1),
+                "integrated_darkness": round(float(np.mean(ids)), 2),
+                "mean_darkness": round(
+                    float(np.mean([c["mean_darkness"] for c in day["colonies"]])), 2
+                ),
+                "std_integrated_darkness": round(float(np.std(ids)), 2),
+                "std_area": round(float(np.std(areas)), 1),
+            }
+        )
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
-# ── Main UI ───────────────────────────────────────────────────────────────────
+# ── Main UI ──────────────────────────────────────────────────────────────────
 st.markdown("### Upload Images")
-st.info("Name files as `A20260611.jpg` (letter + YYYYMMDD). Upload all batches together.")
+st.info("Name files as `A20260611.tif` (letter + YYYYMMDD). Upload all batches together.")
 
 uploaded_files = st.file_uploader(
     "Upload all plate images",
-    type=["jpg", "jpeg", "png", "tiff", "tif"],
-    accept_multiple_files=True
+    type=["tif", "tiff"],
+    accept_multiple_files=True,
 )
 
-run_btn = st.button("🔬 Analyze All Batches", type="primary", use_container_width=True,
-                    disabled=not uploaded_files)
+run_btn = st.button(
+    "🔬 Analyze All Batches", type="primary", use_container_width=True,
+    disabled=not uploaded_files,
+)
 
 if run_btn and uploaded_files:
-    # ── Parse and group files ─────────────────────────────────────────────────
     batches = defaultdict(list)
     bad_files = []
     for f in uploaded_files:
@@ -303,104 +362,151 @@ if run_btn and uploaded_files:
             batches[batch].append((date, f))
 
     if bad_files:
-        st.warning(f"Skipped files with unrecognized names: {', '.join(bad_files)}\nExpected format: A20260611.jpg")
+        st.warning(
+            f"Skipped files with unrecognized names: {', '.join(bad_files)}. "
+            "Expected format: A20260611.tif"
+        )
 
     if not batches:
-        st.error("No valid files found. Check filenames match format: A20260611.jpg")
+        st.error("No valid files found. Check filenames match format: A20260611.tif")
         st.stop()
 
-    # Sort each batch by date
     for batch in batches:
         batches[batch] = sorted(batches[batch], key=lambda x: x[0])
 
-    st.markdown(f"**Found {len(batches)} batch(es):** {', '.join(sorted(batches.keys()))}")
+    st.markdown(
+        f"**Found {len(batches)} batch(es):** {', '.join(sorted(batches.keys()))}"
+    )
     st.markdown("---")
 
     total_images = sum(len(v) for v in batches.values())
     progress = st.progress(0)
     processed = 0
-
     batch_results = []
 
-    # ── Process each batch ────────────────────────────────────────────────────
     for batch_name in sorted(batches.keys()):
-        batch_days = batches[batch_name]
         batch_data = []
+        status = st.empty()
 
-        for date, file in batch_days:
-            status = st.empty()
+        for date, file in batches[batch_name]:
             status.info(f"Batch {batch_name} — {date.strftime('%b %d %Y')}...")
 
-            pil_image = Image.open(file).convert("RGB")
-            image_np = np.array(pil_image)
+            try:
+                gray = load_gray(file.getvalue())
+            except Exception as exc:
+                st.error(f"Could not read {file.name}: {exc}")
+                st.stop()
 
-            colonies = detect_colonies(image_np)
+            colonies, _signal, n_blobs = detect_colonies(gray)
+            if not colonies:
+                st.error(
+                    f"No colonies detected in {file.name}. Check the image is a "
+                    "cropped 4×4 grid from the gel imager."
+                )
+                st.stop()
 
-            # QC
             for c in colonies:
-                c["qc_flag"], c["qc_note"] = run_qc(c)
+                c["qc_flag"], c["qc_note"] = run_qc(c, colonies)
 
-            batch_data.append({"date": date, "colonies": colonies})
+            batch_data.append(
+                {"date": date, "colonies": colonies, "n_blobs": n_blobs}
+            )
             processed += 1
             progress.progress(processed / total_images)
-            status.empty()
 
-        # ── Generate chart bytes (stored so reruns don't recompute) ──────────
-        dark_chart_bytes = make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name).getvalue()
+        status.empty()
 
-        # ── Summary table (colony averages across all days) ───────────────────
+        id_chart = make_chart(
+            batch_data, "integrated_darkness", "Integrated darkness", batch_name
+        )
+        area_chart = make_chart(
+            batch_data, "area_px", "Colony area (px)", batch_name
+        )
+        id_bytes = id_chart.getvalue()
+        area_bytes = area_chart.getvalue()
+
         colony_ids = [c["colony_id"] for c in batch_data[0]["colonies"]]
         summary_rows = []
         for cid in colony_ids:
-            d_scores = []
-            a_scores = []
+            ids, areas = [], []
             for day in batch_data:
-                match = next((c for c in day["colonies"] if c["colony_id"] == cid), None)
-                if match:
-                    d_scores.append(match["integrated_darkness"])
-                    a_scores.append(match["area_px"])
-            summary_rows.append({
-                "Colony": cid,
-                "Avg Integrated Darkness": round(np.mean(d_scores), 2) if d_scores else 0,
-                "Avg Area (px)": round(np.mean(a_scores), 1) if a_scores else 0,
-            })
-
+                m = next(
+                    (c for c in day["colonies"] if c["colony_id"] == cid), None
+                )
+                if m:
+                    ids.append(m["integrated_darkness"])
+                    areas.append(m["area_px"])
+            summary_rows.append(
+                {
+                    "Colony": cid,
+                    "Avg Integrated Darkness": round(np.mean(ids), 1) if ids else 0,
+                    "Avg Area (px)": round(np.mean(areas), 1) if areas else 0,
+                }
+            )
         df_sum = pd.DataFrame(summary_rows)
-        avg_row = pd.DataFrame([{
-            "Colony": "AVERAGE",
-            "Avg Integrated Darkness": round(df_sum["Avg Integrated Darkness"].mean(), 2),
-            "Avg Area (px)": round(df_sum["Avg Area (px)"].mean(), 1),
-        }])
-        df_sum = pd.concat([df_sum, avg_row], ignore_index=True)
+        df_sum = pd.concat(
+            [
+                df_sum,
+                pd.DataFrame(
+                    [
+                        {
+                            "Colony": "AVERAGE",
+                            "Avg Integrated Darkness": round(
+                                df_sum["Avg Integrated Darkness"].mean(), 1
+                            ),
+                            "Avg Area (px)": round(df_sum["Avg Area (px)"].mean(), 1),
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
 
-        # ── Build download bytes ──────────────────────────────────────────────
         csv_bytes = build_csv(batch_name, batch_data)
         word_bytes = build_word_doc(
-            batch_name, batch_data,
-            make_chart(batch_data, "integrated_darkness", "Integrated Darkness", batch_name),
+            batch_name,
+            batch_data,
+            [
+                ("Integrated Darkness Over Time", io.BytesIO(id_bytes)),
+                ("Colony Area Over Time", io.BytesIO(area_bytes)),
+            ],
         ).getvalue()
 
-        batch_results.append({
-            "batch_name": batch_name,
-            "batch_data": batch_data,
-            "dark_chart_bytes": dark_chart_bytes,
-            "df_summary": df_sum,
-            "csv_bytes": csv_bytes,
-            "word_bytes": word_bytes,
-        })
+        batch_results.append(
+            {
+                "batch_name": batch_name,
+                "id_chart_bytes": id_bytes,
+                "area_chart_bytes": area_bytes,
+                "df_summary": df_sum,
+                "csv_bytes": csv_bytes,
+                "word_bytes": word_bytes,
+            }
+        )
 
     st.session_state.batch_results = batch_results
     progress.progress(1.0)
     st.success("✅ All batches complete!")
 
-# ── Display results (persists across reruns so downloads don't clear UI) ──────
+
+# ── Display results (persists across reruns so downloads don't clear UI) ─────
 if "batch_results" in st.session_state:
     for result in st.session_state.batch_results:
         batch_name = result["batch_name"]
-
         st.markdown(f"## Batch {batch_name}")
 
-        st.image(result["dark_chart_bytes"], caption=f"Batch {batch_name} — Integrated Darkness", use_column_width=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.image(
+                result["id_chart_bytes"],
+                caption=f"Batch {batch_name} — Integrated Darkness",
+                use_column_width=True,
+            )
+        with col2:
+            st.image(
+                result["area_chart_bytes"],
+                caption=f"Batch {batch_name} — Colony Area",
+                use_column_width=True,
+            )
 
         st.markdown(f"#### Colony Averages — Batch {batch_name}")
         st.dataframe(result["df_summary"], use_container_width=True, hide_index=True)
@@ -421,7 +527,8 @@ if "batch_results" in st.session_state:
                 f"📄 Word Report — Batch {batch_name}",
                 result["word_bytes"],
                 file_name=f"batch_{batch_name}_report.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                mime="application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document",
                 use_container_width=True,
                 key=f"word_{batch_name}",
             )
