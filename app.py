@@ -499,13 +499,13 @@ if "batch_results" in st.session_state:
             st.image(
                 result["id_chart_bytes"],
                 caption=f"Batch {batch_name} — Integrated Darkness",
-                use_column_width=True,
+                use_container_width=True,
             )
         with col2:
             st.image(
                 result["area_chart_bytes"],
                 caption=f"Batch {batch_name} — Colony Area",
-                use_column_width=True,
+                use_container_width=True,
             )
 
         st.markdown(f"#### Colony Averages — Batch {batch_name}")
