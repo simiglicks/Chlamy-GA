@@ -229,11 +229,16 @@ def make_chart(batch_data, metric, metric_label, batch_name):
 
 
 # ── Batch comparison chart ────────────────────────────────────────────────────
-def make_comparison_chart(selected, metric, metric_label, labels):
+def make_comparison_chart(selected, metric, metric_label, labels, normalize):
     """
     Overlay each selected batch's QC-filtered mean growth curve on one chart,
     x-axis normalized to days since that batch's own first timepoint so
     batches don't need to share calendar dates.
+
+    If normalize is True, each batch's y-values are divided by its own day-0
+    value so every curve starts at 1.0 — removes plate-to-plate differences
+    in starting darkness/spread so shape/rate of growth can be compared
+    directly.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     cmap = plt.get_cmap("tab10")
@@ -246,18 +251,39 @@ def make_comparison_chart(selected, metric, metric_label, labels):
         first_date = daily_summary[0]["date"]
         days_since = [(d["date"] - first_date).days for d in daily_summary]
         values = [d[metric] for d in daily_summary]
+
+        if normalize:
+            baseline = values[0]
+            if baseline and not np.isnan(baseline):
+                values = [v / baseline for v in values]
+            else:
+                st.warning(
+                    f"Batch {batch_name}: day-0 value is missing/zero (all "
+                    "colonies failed QC that day?) — could not normalize, "
+                    "plotting raw values instead."
+                )
+
         label = labels.get(batch_name, batch_name)
         ax.plot(
             days_since, values, color=cmap(i % 10), linewidth=2.5, marker="o",
             markersize=5, label=label,
         )
 
+    if normalize:
+        ax.axhline(1.0, color="grey", linewidth=1, linestyle="--", alpha=0.5)
+        y_label = f"{metric_label} (relative to day 0)"
+        title_suffix = "normalized to each batch's own day 0"
+    else:
+        y_label = f"{metric_label} (a.u.)"
+        title_suffix = "raw values"
+
     ax.set_title(
-        f"Batch comparison — {metric_label}\n(QC-passed colonies only, mean per batch)",
+        f"Batch comparison — {metric_label}\n"
+        f"(QC-passed colonies only, mean per batch, {title_suffix})",
         fontsize=12, fontweight="bold",
     )
     ax.set_xlabel("Days since each batch's first timepoint")
-    ax.set_ylabel(f"{metric_label} (a.u.)")
+    ax.set_ylabel(y_label)
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -628,8 +654,20 @@ if "batch_results" in st.session_state:
             if metric_choice == "Integrated Darkness"
             else "avg_area_px"
         )
+        normalize = st.checkbox(
+            "Normalize to day 0 (every curve starts at 1.0)",
+            value=True,
+            help=(
+                "Divides each batch's values by its own day-0 value. Removes "
+                "plate-to-plate differences in starting darkness/spread so "
+                "growth shape and rate can be compared directly. Turn off to "
+                "see raw absolute values."
+            ),
+        )
 
-        comp_chart = make_comparison_chart(selected, metric_key, metric_choice, labels)
+        comp_chart = make_comparison_chart(
+            selected, metric_key, metric_choice, labels, normalize
+        )
         st.image(comp_chart.getvalue(), use_container_width=True)
 
         # Combined summary table
@@ -640,15 +678,18 @@ if "batch_results" in st.session_state:
                 if r["batch_name"] == b
             )
             first_date = daily_summary[0]["date"]
+            baseline = daily_summary[0][metric_key]
             for d in daily_summary:
+                raw_val = d[metric_key]
+                if normalize and baseline and not np.isnan(baseline):
+                    display_val = round(raw_val / baseline, 3) if not np.isnan(raw_val) else None
+                else:
+                    display_val = round(raw_val, 1) if not np.isnan(raw_val) else None
                 rows.append(
                     {
                         "Batch": labels[b],
                         "Days Since Start": (d["date"] - first_date).days,
-                        "Avg Integrated Darkness": round(d["avg_integrated_darkness"], 1)
-                        if not np.isnan(d["avg_integrated_darkness"]) else None,
-                        "Avg Area (px)": round(d["avg_area_px"], 1)
-                        if not np.isnan(d["avg_area_px"]) else None,
+                        metric_choice + (" (relative to day 0)" if normalize else " (raw)"): display_val,
                         "Passed QC": f"{d['n_passed_qc']}/{d['n_total']}",
                     }
                 )
