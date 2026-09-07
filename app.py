@@ -96,6 +96,14 @@ def detect_colonies(gray):
        with k-means. Robust to stray blobs, unlike sort-and-chunk, which
        mis-assigns every colony after a single misplaced point.
     5. Integrate the darkness signal pixel by pixel within each colony mask.
+    6. Estimate a per-image "blank plate" offset from the four corners of the
+       crop (outside the 4x4 grid, so no colony blobs should live there) and
+       report a blank-corrected integrated darkness alongside the raw value.
+       This uses no additional images — just unused plate area already
+       present in every crop — so it can flag/cancel a widespread haze
+       (e.g. undissolved urea residue) that the local gaussian background
+       step doesn't fully remove, since that step only equalizes brightness
+       *within* an image, not against a shared external zero.
 
     Returns a list of 16 dicts sorted R1C1..R4C4.
     """
@@ -113,6 +121,24 @@ def detect_colonies(gray):
     if len(props) < 2:
         return [], signal, 0
 
+    # Blank-plate offset: median signal value sampled from the four corners
+    # of the crop. Median (not mean) so a stray blob or edge artifact caught
+    # in a corner doesn't skew it. Ideally near 0, since local background
+    # subtraction already flattens illumination — a value that's
+    # meaningfully non-zero suggests something (haze, residue, edge glare)
+    # is uniformly present across the plate in that image.
+    H, W = signal.shape
+    mh, mw = max(1, int(H * 0.12)), max(1, int(W * 0.12))
+    corners = np.concatenate(
+        [
+            signal[:mh, :mw].ravel(),
+            signal[:mh, -mw:].ravel(),
+            signal[-mh:, :mw].ravel(),
+            signal[-mh:, -mw:].ravel(),
+        ]
+    )
+    background_offset = float(np.median(corners))
+
     centroids = np.array([p.centroid for p in props], dtype=float)
 
     # Fit the lattice: cluster rows and columns independently.
@@ -128,6 +154,7 @@ def detect_colonies(gray):
         r_idx = int(np.argmin(np.abs(row_centers - cy)))
         c_idx = int(np.argmin(np.abs(col_centers - cx)))
         mask = labels == prop.label
+        integrated_darkness = float(signal[mask].sum())
         colonies.append(
             {
                 "colony_id": f"R{r_idx + 1}C{c_idx + 1}",
@@ -136,8 +163,11 @@ def detect_colonies(gray):
                 "cy": float(cy),
                 "cx": float(cx),
                 "area_px": int(prop.area),
-                "integrated_darkness": float(signal[mask].sum()),
+                "integrated_darkness": integrated_darkness,
                 "mean_darkness": float(signal[mask].mean()),
+                "background_offset_per_px": background_offset,
+                "corrected_integrated_darkness": integrated_darkness
+                - background_offset * int(prop.area),
             }
         )
 
@@ -158,6 +188,8 @@ def detect_colonies(gray):
                         "area_px": 0,
                         "integrated_darkness": 0.0,
                         "mean_darkness": 0.0,
+                        "background_offset_per_px": background_offset,
+                        "corrected_integrated_darkness": 0.0,
                     }
                 )
 
@@ -236,15 +268,21 @@ def make_comparison_chart(selected, metric, metric_label, labels, mode):
     batches don't need to share calendar dates.
 
     mode:
-      "raw"   - plot absolute values as-is.
-      "ratio" - divide by each batch's own day-0 value (every curve starts at
-                1.0). Sensitive to baseline size; a small/noisy day-0 value
-                inflates the apparent fold-change.
-      "delta" - subtract each batch's own day-0 value (every curve starts at
-                0). More forgiving of an additive baseline offset (e.g. a
-                constant optical contribution unrelated to cell growth) than
-                a ratio is, since it asks "how much did it increase" rather
-                than "what multiple did it increase by."
+      "raw"      - plot absolute values as-is.
+      "anchored" - plot absolute values as-is, but prepend a shared,
+                   assumed-identical starting point (x=0, y=0) before every
+                   batch's real first image. Reflects "all batches started
+                   from the same known cell density at plating" as a design
+                   fact, without using any one image's value as that zero —
+                   so, unlike "delta", the real first image stays on the
+                   curve as genuine data rather than being subtracted away.
+      "ratio"    - divide by each batch's own day-0 value (every curve
+                   starts at 1.0). Sensitive to baseline size; a small/noisy
+                   day-0 value inflates the apparent fold-change.
+      "delta"    - subtract each batch's own day-0 value (every curve starts
+                   at 0). More forgiving of an additive baseline offset than
+                   a ratio, but discards whatever the first real image
+                   showed by using it as the zero point.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     cmap = plt.get_cmap("tab10")
@@ -258,7 +296,10 @@ def make_comparison_chart(selected, metric, metric_label, labels, mode):
         days_since = [(d["date"] - first_date).days for d in daily_summary]
         values = [d[metric] for d in daily_summary]
 
-        if mode in ("ratio", "delta"):
+        if mode == "anchored":
+            days_since = [0] + [d + 1 for d in days_since]
+            values = [0.0] + values
+        elif mode in ("ratio", "delta"):
             baseline = values[0]
             if baseline is not None and not np.isnan(baseline):
                 if mode == "ratio":
@@ -288,20 +329,28 @@ def make_comparison_chart(selected, metric, metric_label, labels, mode):
         ax.axhline(1.0, color="grey", linewidth=1, linestyle="--", alpha=0.5)
         y_label = f"{metric_label} (ratio to day 0)"
         title_suffix = "ratio to each batch's own day 0"
+        x_label = "Days since each batch's first timepoint"
     elif mode == "delta":
         ax.axhline(0.0, color="grey", linewidth=1, linestyle="--", alpha=0.5)
         y_label = f"{metric_label} (change from day 0)"
         title_suffix = "change (delta) from each batch's own day 0"
+        x_label = "Days since each batch's first timepoint"
+    elif mode == "anchored":
+        ax.axhline(0.0, color="grey", linewidth=1, linestyle="--", alpha=0.5)
+        y_label = f"{metric_label} (a.u.)"
+        title_suffix = "raw values, anchored to an assumed common start at plating"
+        x_label = "Days since assumed common start (plating)"
     else:
         y_label = f"{metric_label} (a.u.)"
         title_suffix = "raw absolute values"
+        x_label = "Days since each batch's first timepoint"
 
     ax.set_title(
         f"Batch comparison — {metric_label}\n"
         f"(QC-passed colonies only, mean per batch, {title_suffix})",
         fontsize=12, fontweight="bold",
     )
-    ax.set_xlabel("Days since each batch's first timepoint")
+    ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -349,10 +398,14 @@ def build_word_doc(batch_name, batch_data, chart_bufs):
 
         valid = [c for c in day["colonies"] if c["qc_flag"] == "OK"]
         avg_id = np.mean([c["integrated_darkness"] for c in valid]) if valid else 0
+        avg_id_corr = np.mean(
+            [c["corrected_integrated_darkness"] for c in valid]
+        ) if valid else 0
         avg_area = np.mean([c["area_px"] for c in valid]) if valid else 0
         flags = sum(1 for c in day["colonies"] if c["qc_flag"] == "FLAG")
         doc.add_paragraph(
-            f"Mean integrated darkness: {avg_id:,.0f}   |   "
+            f"Mean integrated darkness: {avg_id:,.0f} "
+            f"(blank-corrected: {avg_id_corr:,.0f})   |   "
             f"Mean area: {avg_area:,.0f} px   |   "
             f"Passed QC: {len(valid)}/16 (Flagged: {flags}/16)"
         )
@@ -399,13 +452,20 @@ def build_csv(batch_name, batch_data):
                     "colony_id": c["colony_id"],
                     "area_px": c["area_px"],
                     "integrated_darkness": round(c["integrated_darkness"], 2),
+                    "corrected_integrated_darkness": round(
+                        c["corrected_integrated_darkness"], 2
+                    ),
                     "mean_darkness": round(c["mean_darkness"], 2),
+                    "background_offset_per_px": round(
+                        c["background_offset_per_px"], 4
+                    ),
                     "qc_flag": c["qc_flag"],
                     "qc_note": c["qc_note"],
                 }
             )
         passed = [c for c in day["colonies"] if c["qc_flag"] == "OK"]
         ids = [c["integrated_darkness"] for c in passed]
+        corrected_ids = [c["corrected_integrated_darkness"] for c in passed]
         areas = [c["area_px"] for c in passed]
         rows.append(
             {
@@ -414,6 +474,9 @@ def build_csv(batch_name, batch_data):
                 "colony_id": "AVERAGE",
                 "area_px": round(float(np.mean(areas)), 1) if areas else 0,
                 "integrated_darkness": round(float(np.mean(ids)), 2) if ids else 0,
+                "corrected_integrated_darkness": round(
+                    float(np.mean(corrected_ids)), 2
+                ) if corrected_ids else 0,
                 "mean_darkness": round(
                     float(np.mean([c["mean_darkness"] for c in passed])), 2
                 ) if passed else 0,
@@ -562,6 +625,9 @@ if run_btn and uploaded_files:
                     "avg_integrated_darkness": float(
                         np.mean([c["integrated_darkness"] for c in passed])
                     ) if passed else np.nan,
+                    "avg_integrated_darkness_corrected": float(
+                        np.mean([c["corrected_integrated_darkness"] for c in passed])
+                    ) if passed else np.nan,
                     "avg_area_px": float(
                         np.mean([c["area_px"] for c in passed])
                     ) if passed else np.nan,
@@ -666,29 +732,60 @@ if "batch_results" in st.session_state:
                 )
 
         metric_choice = st.radio(
-            "Metric", ["Integrated Darkness", "Colony Area"], horizontal=True
-        )
-        metric_key = (
-            "avg_integrated_darkness"
-            if metric_choice == "Integrated Darkness"
-            else "avg_area_px"
-        )
-        mode_choice = st.radio(
-            "View",
-            ["Raw values", "Ratio to day 0", "Delta from day 0"],
+            "Metric",
+            [
+                "Integrated Darkness",
+                "Integrated Darkness (blank-corrected)",
+                "Colony Area",
+            ],
             horizontal=True,
             help=(
-                "Raw: absolute values, no adjustment. "
-                "Ratio: divide by each batch's own day-0 value (every curve "
-                "starts at 1.0) — sensitive to how large/small that starting "
-                "value was. "
-                "Delta: subtract each batch's own day-0 value (every curve "
-                "starts at 0) — more forgiving of a constant baseline "
-                "offset between conditions than ratio is."
+                "Blank-corrected subtracts a per-image background estimate "
+                "sampled from the four corners of each crop (outside the "
+                "4×4 grid) from every colony's integrated darkness before "
+                "averaging. Uses no extra images — just unused plate area "
+                "already present in every crop. Helps cancel a uniform "
+                "haze/offset (e.g. residual crystal contribution) that the "
+                "existing local-background step doesn't fully remove, since "
+                "that step only equalizes brightness within one image, not "
+                "against a shared zero."
             ),
         )
-        mode = {"Raw values": "raw", "Ratio to day 0": "ratio",
-                "Delta from day 0": "delta"}[mode_choice]
+        metric_key = {
+            "Integrated Darkness": "avg_integrated_darkness",
+            "Integrated Darkness (blank-corrected)": "avg_integrated_darkness_corrected",
+            "Colony Area": "avg_area_px",
+        }[metric_choice]
+        mode_choice = st.radio(
+            "View",
+            [
+                "Raw values",
+                "Raw values, assumed common start",
+                "Ratio to day 0",
+                "Delta from day 0",
+            ],
+            horizontal=True,
+            help=(
+                "Raw: absolute values, no adjustment, each batch starts "
+                "wherever its first image measured. "
+                "Assumed common start: same raw values, but a shared "
+                "assumed-identical zero point (plating) is added before "
+                "each batch's real first image — the first image itself "
+                "stays on the curve as real data, unlike Delta. "
+                "Ratio: divide by each batch's own day-0 value (every curve "
+                "starts at 1.0) — sensitive to how large/small that "
+                "starting value was. "
+                "Delta: subtract each batch's own day-0 value (every curve "
+                "starts at 0) — the first real image is used as the zero "
+                "and its info is folded into every later point."
+            ),
+        )
+        mode = {
+            "Raw values": "raw",
+            "Raw values, assumed common start": "anchored",
+            "Ratio to day 0": "ratio",
+            "Delta from day 0": "delta",
+        }[mode_choice]
 
         comp_chart = make_comparison_chart(
             selected, metric_key, metric_choice, labels, mode
@@ -704,6 +801,29 @@ if "batch_results" in st.session_state:
             )
             first_date = daily_summary[0]["date"]
             baseline = daily_summary[0][metric_key]
+
+            if mode == "anchored":
+                rows.append(
+                    {
+                        "Batch": labels[b],
+                        "Days Since Start": 0,
+                        metric_choice + " (raw, assumed zero at plating)": 0.0,
+                        "Passed QC": "assumed",
+                    }
+                )
+                for d in daily_summary:
+                    raw_val = d[metric_key]
+                    display_val = round(raw_val, 1) if not np.isnan(raw_val) else None
+                    rows.append(
+                        {
+                            "Batch": labels[b],
+                            "Days Since Start": (d["date"] - first_date).days + 1,
+                            metric_choice + " (raw, assumed zero at plating)": display_val,
+                            "Passed QC": f"{d['n_passed_qc']}/{d['n_total']}",
+                        }
+                    )
+                continue
+
             for d in daily_summary:
                 raw_val = d[metric_key]
                 if mode == "ratio" and baseline and not np.isnan(baseline) and baseline != 0:
