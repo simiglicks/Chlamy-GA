@@ -229,16 +229,22 @@ def make_chart(batch_data, metric, metric_label, batch_name):
 
 
 # ── Batch comparison chart ────────────────────────────────────────────────────
-def make_comparison_chart(selected, metric, metric_label, labels, normalize):
+def make_comparison_chart(selected, metric, metric_label, labels, mode):
     """
     Overlay each selected batch's QC-filtered mean growth curve on one chart,
     x-axis normalized to days since that batch's own first timepoint so
     batches don't need to share calendar dates.
 
-    If normalize is True, each batch's y-values are divided by its own day-0
-    value so every curve starts at 1.0 — removes plate-to-plate differences
-    in starting darkness/spread so shape/rate of growth can be compared
-    directly.
+    mode:
+      "raw"   - plot absolute values as-is.
+      "ratio" - divide by each batch's own day-0 value (every curve starts at
+                1.0). Sensitive to baseline size; a small/noisy day-0 value
+                inflates the apparent fold-change.
+      "delta" - subtract each batch's own day-0 value (every curve starts at
+                0). More forgiving of an additive baseline offset (e.g. a
+                constant optical contribution unrelated to cell growth) than
+                a ratio is, since it asks "how much did it increase" rather
+                than "what multiple did it increase by."
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     cmap = plt.get_cmap("tab10")
@@ -252,13 +258,22 @@ def make_comparison_chart(selected, metric, metric_label, labels, normalize):
         days_since = [(d["date"] - first_date).days for d in daily_summary]
         values = [d[metric] for d in daily_summary]
 
-        if normalize:
+        if mode in ("ratio", "delta"):
             baseline = values[0]
-            if baseline and not np.isnan(baseline):
-                values = [v / baseline for v in values]
+            if baseline is not None and not np.isnan(baseline):
+                if mode == "ratio":
+                    if baseline != 0:
+                        values = [v / baseline for v in values]
+                    else:
+                        st.warning(
+                            f"Batch {batch_name}: day-0 value is 0 — cannot "
+                            "compute ratio, plotting raw values instead."
+                        )
+                else:  # delta
+                    values = [v - baseline for v in values]
             else:
                 st.warning(
-                    f"Batch {batch_name}: day-0 value is missing/zero (all "
+                    f"Batch {batch_name}: day-0 value is missing (all "
                     "colonies failed QC that day?) — could not normalize, "
                     "plotting raw values instead."
                 )
@@ -269,13 +284,17 @@ def make_comparison_chart(selected, metric, metric_label, labels, normalize):
             markersize=5, label=label,
         )
 
-    if normalize:
+    if mode == "ratio":
         ax.axhline(1.0, color="grey", linewidth=1, linestyle="--", alpha=0.5)
-        y_label = f"{metric_label} (relative to day 0)"
-        title_suffix = "normalized to each batch's own day 0"
+        y_label = f"{metric_label} (ratio to day 0)"
+        title_suffix = "ratio to each batch's own day 0"
+    elif mode == "delta":
+        ax.axhline(0.0, color="grey", linewidth=1, linestyle="--", alpha=0.5)
+        y_label = f"{metric_label} (change from day 0)"
+        title_suffix = "change (delta) from each batch's own day 0"
     else:
         y_label = f"{metric_label} (a.u.)"
-        title_suffix = "raw values"
+        title_suffix = "raw absolute values"
 
     ax.set_title(
         f"Batch comparison — {metric_label}\n"
@@ -654,19 +673,25 @@ if "batch_results" in st.session_state:
             if metric_choice == "Integrated Darkness"
             else "avg_area_px"
         )
-        normalize = st.checkbox(
-            "Normalize to day 0 (every curve starts at 1.0)",
-            value=True,
+        mode_choice = st.radio(
+            "View",
+            ["Raw values", "Ratio to day 0", "Delta from day 0"],
+            horizontal=True,
             help=(
-                "Divides each batch's values by its own day-0 value. Removes "
-                "plate-to-plate differences in starting darkness/spread so "
-                "growth shape and rate can be compared directly. Turn off to "
-                "see raw absolute values."
+                "Raw: absolute values, no adjustment. "
+                "Ratio: divide by each batch's own day-0 value (every curve "
+                "starts at 1.0) — sensitive to how large/small that starting "
+                "value was. "
+                "Delta: subtract each batch's own day-0 value (every curve "
+                "starts at 0) — more forgiving of a constant baseline "
+                "offset between conditions than ratio is."
             ),
         )
+        mode = {"Raw values": "raw", "Ratio to day 0": "ratio",
+                "Delta from day 0": "delta"}[mode_choice]
 
         comp_chart = make_comparison_chart(
-            selected, metric_key, metric_choice, labels, normalize
+            selected, metric_key, metric_choice, labels, mode
         )
         st.image(comp_chart.getvalue(), use_container_width=True)
 
@@ -681,15 +706,20 @@ if "batch_results" in st.session_state:
             baseline = daily_summary[0][metric_key]
             for d in daily_summary:
                 raw_val = d[metric_key]
-                if normalize and baseline and not np.isnan(baseline):
+                if mode == "ratio" and baseline and not np.isnan(baseline) and baseline != 0:
                     display_val = round(raw_val / baseline, 3) if not np.isnan(raw_val) else None
+                    col_name = metric_choice + " (ratio to day 0)"
+                elif mode == "delta" and baseline is not None and not np.isnan(baseline):
+                    display_val = round(raw_val - baseline, 1) if not np.isnan(raw_val) else None
+                    col_name = metric_choice + " (delta from day 0)"
                 else:
                     display_val = round(raw_val, 1) if not np.isnan(raw_val) else None
+                    col_name = metric_choice + " (raw)"
                 rows.append(
                     {
                         "Batch": labels[b],
                         "Days Since Start": (d["date"] - first_date).days,
-                        metric_choice + (" (relative to day 0)" if normalize else " (raw)"): display_val,
+                        col_name: display_val,
                         "Passed QC": f"{d['n_passed_qc']}/{d['n_total']}",
                     }
                 )
