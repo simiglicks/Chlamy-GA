@@ -194,7 +194,7 @@ def make_chart(batch_data, metric, metric_label, batch_name):
             )
             values.append(
                 float(colony[metric])
-                if colony and colony["area_px"] > 0
+                if colony and colony["qc_flag"] == "OK"
                 else np.nan
             )
         series.append(values)
@@ -217,6 +217,47 @@ def make_chart(batch_data, metric, metric_label, batch_name):
     ax.set_xlabel("Days since first timepoint")
     ax.set_ylabel(f"{metric_label} (a.u.)")
     ax.set_xticks(sorted(set(days_since)))
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ── Batch comparison chart ────────────────────────────────────────────────────
+def make_comparison_chart(selected, metric, metric_label, labels):
+    """
+    Overlay each selected batch's QC-filtered mean growth curve on one chart,
+    x-axis normalized to days since that batch's own first timepoint so
+    batches don't need to share calendar dates.
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cmap = plt.get_cmap("tab10")
+
+    for i, batch_name in enumerate(selected):
+        daily_summary = next(
+            r["daily_summary"] for r in st.session_state.batch_results
+            if r["batch_name"] == batch_name
+        )
+        first_date = daily_summary[0]["date"]
+        days_since = [(d["date"] - first_date).days for d in daily_summary]
+        values = [d[metric] for d in daily_summary]
+        label = labels.get(batch_name, batch_name)
+        ax.plot(
+            days_since, values, color=cmap(i % 10), linewidth=2.5, marker="o",
+            markersize=5, label=label,
+        )
+
+    ax.set_title(
+        f"Batch comparison — {metric_label}\n(QC-passed colonies only, mean per batch)",
+        fontsize=12, fontweight="bold",
+    )
+    ax.set_xlabel("Days since each batch's first timepoint")
+    ax.set_ylabel(f"{metric_label} (a.u.)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -261,13 +302,14 @@ def build_word_doc(batch_name, batch_data, chart_bufs):
     for day in batch_data:
         doc.add_heading(day["date"].strftime("%B %d, %Y"), level=2)
 
-        valid = [c for c in day["colonies"] if c["area_px"] > 0]
+        valid = [c for c in day["colonies"] if c["qc_flag"] == "OK"]
         avg_id = np.mean([c["integrated_darkness"] for c in valid]) if valid else 0
         avg_area = np.mean([c["area_px"] for c in valid]) if valid else 0
         flags = sum(1 for c in day["colonies"] if c["qc_flag"] == "FLAG")
         doc.add_paragraph(
             f"Mean integrated darkness: {avg_id:,.0f}   |   "
-            f"Mean area: {avg_area:,.0f} px   |   Flagged: {flags}/16"
+            f"Mean area: {avg_area:,.0f} px   |   "
+            f"Passed QC: {len(valid)}/16 (Flagged: {flags}/16)"
         )
 
         table = doc.add_table(rows=1, cols=6)
@@ -317,20 +359,23 @@ def build_csv(batch_name, batch_data):
                     "qc_note": c["qc_note"],
                 }
             )
-        ids = [c["integrated_darkness"] for c in day["colonies"]]
-        areas = [c["area_px"] for c in day["colonies"]]
+        passed = [c for c in day["colonies"] if c["qc_flag"] == "OK"]
+        ids = [c["integrated_darkness"] for c in passed]
+        areas = [c["area_px"] for c in passed]
         rows.append(
             {
                 "batch": batch_name,
                 "date": date_str,
                 "colony_id": "AVERAGE",
-                "area_px": round(float(np.mean(areas)), 1),
-                "integrated_darkness": round(float(np.mean(ids)), 2),
+                "area_px": round(float(np.mean(areas)), 1) if areas else 0,
+                "integrated_darkness": round(float(np.mean(ids)), 2) if ids else 0,
                 "mean_darkness": round(
-                    float(np.mean([c["mean_darkness"] for c in day["colonies"]])), 2
-                ),
-                "std_integrated_darkness": round(float(np.std(ids)), 2),
-                "std_area": round(float(np.std(areas)), 1),
+                    float(np.mean([c["mean_darkness"] for c in passed])), 2
+                ) if passed else 0,
+                "std_integrated_darkness": round(float(np.std(ids)), 2) if ids else 0,
+                "std_area": round(float(np.std(areas)), 1) if areas else 0,
+                "n_passed_qc": len(passed),
+                "n_total": len(day["colonies"]),
             }
         )
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
@@ -433,7 +478,7 @@ if run_btn and uploaded_files:
                 m = next(
                     (c for c in day["colonies"] if c["colony_id"] == cid), None
                 )
-                if m:
+                if m and m["qc_flag"] == "OK":
                     ids.append(m["integrated_darkness"])
                     areas.append(m["area_px"])
             summary_rows.append(
@@ -441,6 +486,7 @@ if run_btn and uploaded_files:
                     "Colony": cid,
                     "Avg Integrated Darkness": round(np.mean(ids), 1) if ids else 0,
                     "Avg Area (px)": round(np.mean(areas), 1) if areas else 0,
+                    "Days Passed QC": f"{len(ids)}/{len(batch_data)}",
                 }
             )
         df_sum = pd.DataFrame(summary_rows)
@@ -462,6 +508,23 @@ if run_btn and uploaded_files:
             ignore_index=True,
         )
 
+        daily_summary = []
+        for day in batch_data:
+            passed = [c for c in day["colonies"] if c["qc_flag"] == "OK"]
+            daily_summary.append(
+                {
+                    "date": day["date"],
+                    "avg_integrated_darkness": float(
+                        np.mean([c["integrated_darkness"] for c in passed])
+                    ) if passed else np.nan,
+                    "avg_area_px": float(
+                        np.mean([c["area_px"] for c in passed])
+                    ) if passed else np.nan,
+                    "n_passed_qc": len(passed),
+                    "n_total": len(day["colonies"]),
+                }
+            )
+
         csv_bytes = build_csv(batch_name, batch_data)
         word_bytes = build_word_doc(
             batch_name,
@@ -480,6 +543,7 @@ if run_btn and uploaded_files:
                 "df_summary": df_sum,
                 "csv_bytes": csv_bytes,
                 "word_bytes": word_bytes,
+                "daily_summary": daily_summary,
             }
         )
 
@@ -534,3 +598,68 @@ if "batch_results" in st.session_state:
             )
 
         st.markdown("---")
+
+    # ── Batch comparison ──────────────────────────────────────────────────
+    st.markdown("## 📊 Compare Batches")
+    st.caption(
+        "Only valid if every selected batch was imaged with the same "
+        "settings/imager and started from the same cell density. Charts use "
+        "QC-passed colonies only."
+    )
+
+    all_batch_names = [r["batch_name"] for r in st.session_state.batch_results]
+    selected = st.multiselect(
+        "Batches to compare", options=all_batch_names, default=all_batch_names
+    )
+
+    if len(selected) >= 2:
+        with st.expander("Optional: label batches by condition"):
+            labels = {}
+            for b in selected:
+                labels[b] = st.text_input(
+                    f"Label for Batch {b}", value=f"Batch {b}", key=f"label_{b}"
+                )
+
+        metric_choice = st.radio(
+            "Metric", ["Integrated Darkness", "Colony Area"], horizontal=True
+        )
+        metric_key = (
+            "avg_integrated_darkness"
+            if metric_choice == "Integrated Darkness"
+            else "avg_area_px"
+        )
+
+        comp_chart = make_comparison_chart(selected, metric_key, metric_choice, labels)
+        st.image(comp_chart.getvalue(), use_container_width=True)
+
+        # Combined summary table
+        rows = []
+        for b in selected:
+            daily_summary = next(
+                r["daily_summary"] for r in st.session_state.batch_results
+                if r["batch_name"] == b
+            )
+            first_date = daily_summary[0]["date"]
+            for d in daily_summary:
+                rows.append(
+                    {
+                        "Batch": labels[b],
+                        "Days Since Start": (d["date"] - first_date).days,
+                        "Avg Integrated Darkness": round(d["avg_integrated_darkness"], 1)
+                        if not np.isnan(d["avg_integrated_darkness"]) else None,
+                        "Avg Area (px)": round(d["avg_area_px"], 1)
+                        if not np.isnan(d["avg_area_px"]) else None,
+                        "Passed QC": f"{d['n_passed_qc']}/{d['n_total']}",
+                    }
+                )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        comp_csv = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download comparison CSV",
+            comp_csv,
+            file_name="batch_comparison.csv",
+            mime="text/csv",
+        )
+    elif len(selected) == 1:
+        st.info("Select at least 2 batches to compare.")
